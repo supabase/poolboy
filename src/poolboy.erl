@@ -280,21 +280,15 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             NewState = handle_worker_exit(Pid, State),
             {noreply, NewState};
         [] ->
-            Q = queue:member(Pid, State#state.workers),
-            case queue:member(Pid, State#state.workers) and maps:is_key(Pid, State#state.idle_workers) of
+            % if it was idle, don't restart
+            WasIdle = maps:is_key(Pid, State#state.idle_workers),
+            W = filter_worker_by_pid(Pid, State#state.workers),
+            I = remove_from_idle(Pid, State#state.idle_workers),
+            case WasIdle of
                 true ->
-                    W = filter_worker_by_pid(Pid, State#state.workers),
-                    I = remove_from_idle(Pid, State#state.idle_workers),
                     {noreply, State#state{workers = queue:in(new_worker(Sup), W), idle_workers = I}};
                 false ->
-                    case queue:member(Pid, State#state.workers) of
-                        true ->
-                            W = filter_worker_by_pid(Pid, State#state.workers),
-                            I = remove_from_idle(Pid, State#state.idle_workers),
-                            {noreply, State#state{workers = W, idle_workers = I}};
-                        false ->
-                            {noreply, State}
-                    end
+                    {noreply, State#state{workers = W, idle_workers = I}}
             end
     end;
 
