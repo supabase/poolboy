@@ -284,12 +284,14 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             case queue:member(Pid, State#state.workers) and maps:is_key(Pid, State#state.idle_workers) of
                 true ->
                     W = filter_worker_by_pid(Pid, State#state.workers),
-                    {noreply, State#state{workers = queue:in(new_worker(Sup), W)}};
+                    I = remove_from_idle(Pid, State#state.idle_workers),
+                    {noreply, State#state{workers = queue:in(new_worker(Sup), W), idle_workers = I}};
                 false ->
                     case queue:member(Pid, State#state.workers) of
                         true ->
                             W = filter_worker_by_pid(Pid, State#state.workers),
-                            {noreply, State#state{workers = W}};
+                            I = remove_from_idle(Pid, State#state.idle_workers),
+                            {noreply, State#state{workers = W, idle_workers = I}};
                         false ->
                             {noreply, State}
                     end
@@ -383,13 +385,7 @@ handle_worker_exit(Pid, State) ->
            monitors = Monitors,
            idle_workers = IdleWorkers,
            overflow = Overflow} = State,
-    NewIdleWorkers = case maps:get(Pid, IdleWorkers, undefined) of
-            undefined ->
-                IdleWorkers;
-            ref ->
-                erlang:cancel_timer(ref),
-                maps:remove(Pid, IdleWorkers)
-        end,
+    NewIdleWorkers = remove_from_idle(Pid, IdleWorkers),
     case queue:out(State#state.waiting) of
         {{value, {From, CRef, MRef}}, LeftWaiting} ->
             NewWorker = new_worker(State#state.supervisor),
@@ -415,3 +411,12 @@ state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
     full;
 state_name(_State) ->
     overflow.
+
+remove_from_idle(Pid, IdleWorkers) ->
+    case maps:find(Pid, IdleWorkers) of
+        {ok, Timer} ->
+            erlang:cancel_timer(Timer),
+            maps:remove(Pid, IdleWorkers);
+        error ->
+            IdleWorkers
+    end.
