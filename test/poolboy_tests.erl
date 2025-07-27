@@ -764,7 +764,7 @@ process_dies_holding_overflow_worker() ->
     %% Process goes back to the pool as idle
     ?assertEqual(1, queue:len(pool_call(Pid, get_avail_workers))),
     ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
-    ?assert(lists:member(OverflowWorker, [W || {_, W, _, _} <- pool_call(Pid, get_all_workers)])),
+    ?assert(lists:member(OverflowWorker, [P || {_, P, _, _} <- pool_call(Pid, get_all_workers)])),
     ?assert(maps:is_key(OverflowWorker, pool_call(Pid, get_idle_workers))),
 
     [checkin_worker(Pid, Worker) || Worker <- [A, B, C]],

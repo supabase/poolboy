@@ -295,10 +295,7 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             end
     end;
 
-handle_info({dismiss_idle, Pid}, State) ->
-    #state{supervisor = Sup,
-           idle_workers = IdleWorkers,
-           overflow = Overflow} = State,
+handle_info({dismiss_idle, Pid}, #state{supervisor = Sup, idle_workers = IdleWorkers} = State) ->
     ok = dismiss_worker(Sup, Pid),
     NewIdleWorkers = maps:remove(Pid, IdleWorkers),
     Workers = filter_worker_by_pid(Pid, State#state.workers),
