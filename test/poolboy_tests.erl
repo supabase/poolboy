@@ -86,7 +86,11 @@ pool_test_() ->
             {<<"Idle worker behavior with zero overflow">>,
                 fun idle_worker_no_overflow/0},
             {<<"Idle worker behavior during pool shutdown">>,
-                fun idle_worker_pool_shutdown/0}
+                fun idle_worker_pool_shutdown/0},
+            {<<"Idle worker dies while idle">>,
+                {timeout, 10, fun idle_worker_dies_while_idle/0}},
+            {<<"Process dies holding overflow worker">>,
+                {timeout, 10, fun process_dies_holding_overflow_worker/0}}
         ]
     }.
 
@@ -536,11 +540,17 @@ idle_worker_timeout() ->
 
     ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
     ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
+    IdleWorkers1 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(2, maps:size(IdleWorkers1)),
+    ?assert(maps:is_key(A, IdleWorkers1)),
+    ?assert(maps:is_key(B, IdleWorkers1)),
 
     timer:sleep(3000),
 
     ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
     ?assertEqual(2, length(pool_call(Pid, get_all_workers))),
+    IdleWorkers2 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(0, maps:size(IdleWorkers2)),
 
     checkin_worker(Pid, C),
     checkin_worker(Pid, D),
@@ -558,11 +568,16 @@ idle_worker_reuse() ->
     checkin_worker(Pid, A),
     ?assertEqual(1, queue:len(pool_call(Pid, get_avail_workers))),
     ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
+    IdleWorkers1 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(1, maps:size(IdleWorkers1)),
+    ?assert(maps:is_key(A, IdleWorkers1)),
 
     NewWorker = poolboy:checkout(Pid),
     ?assertEqual(A, NewWorker),
     ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
     ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
+    IdleWorkers2 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(0, maps:size(IdleWorkers2)),
 
     checkin_worker(Pid, NewWorker),
     lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
@@ -574,16 +589,24 @@ idle_worker_timer_cancellation() ->
 
     [A | Rest] = Workers,
     checkin_worker(Pid, A),
+    IdleWorkers1 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(1, maps:size(IdleWorkers1)),
+    ?assert(maps:is_key(A, IdleWorkers1)),
     timer:sleep(1000),
 
     ReuseWorker = poolboy:checkout(Pid),
     ?assertEqual(A, ReuseWorker),
+    IdleWorkers2 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(0, maps:size(IdleWorkers2)),
 
     timer:sleep(4000),
 
     checkin_worker(Pid, ReuseWorker),
     ?assertEqual(1, queue:len(pool_call(Pid, get_avail_workers))),
     ?assertEqual(3, length(pool_call(Pid, get_all_workers))),
+    IdleWorkers3 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(1, maps:size(IdleWorkers3)),
+    ?assert(maps:is_key(ReuseWorker, IdleWorkers3)),
 
     lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
     ok = pool_call(Pid, stop).
@@ -617,21 +640,36 @@ multiple_idle_workers() ->
     checkin_worker(Pid, C),
     ?assertEqual(3, queue:len(pool_call(Pid, get_avail_workers))),
     ?assertEqual(5, length(pool_call(Pid, get_all_workers))),
+    IdleWorkers1 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(3, maps:size(IdleWorkers1)),
+    ?assert(maps:is_key(A, IdleWorkers1)),
+    ?assert(maps:is_key(B, IdleWorkers1)),
+    ?assert(maps:is_key(C, IdleWorkers1)),
 
     ReuseWorker = poolboy:checkout(Pid),
     ?assert(lists:member(ReuseWorker, [A, B, C])),
     ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
+    IdleWorkers2 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(2, maps:size(IdleWorkers2)),
+    ?assertNot(maps:is_key(ReuseWorker, IdleWorkers2)),
 
     timer:sleep(4000),
 
     ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
     ?assertEqual(3, length(pool_call(Pid, get_all_workers))),
+    IdleWorkers3 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(0, maps:size(IdleWorkers3)),
 
     checkin_worker(Pid, ReuseWorker),
+    IdleWorkers4 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(1, maps:size(IdleWorkers4)),
+    ?assert(maps:is_key(ReuseWorker, IdleWorkers4)),
 
     timer:sleep(4000),
 
     ?assertEqual(2, length(pool_call(Pid, get_all_workers))),
+    IdleWorkers5 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(0, maps:size(IdleWorkers5)),
 
     lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
     ok = pool_call(Pid, stop).
@@ -647,10 +685,14 @@ idle_worker_no_overflow() ->
     checkin_worker(Pid, B),
     ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
     ?assertEqual(2, length(pool_call(Pid, get_all_workers))),
+    IdleWorkers1 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(0, maps:size(IdleWorkers1)),
 
     timer:sleep(3000),
     ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
     ?assertEqual(2, length(pool_call(Pid, get_all_workers))),
+    IdleWorkers2 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(0, maps:size(IdleWorkers2)),
 
     ok = pool_call(Pid, stop).
 
@@ -665,6 +707,65 @@ idle_worker_pool_shutdown() ->
     ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
 
     lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
+idle_worker_dies_while_idle() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 2, 5000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 4)],
+    ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
+
+    [A, B | Rest] = Workers,
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
+    ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
+    IdleWorkers1 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(2, maps:size(IdleWorkers1)),
+    ?assert(maps:is_key(A, IdleWorkers1)),
+    ?assert(maps:is_key(B, IdleWorkers1)),
+
+    kill_worker(A),
+    timer:sleep(1000),
+
+    ?assertEqual(1, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(3, length(pool_call(Pid, get_all_workers))),
+    IdleWorkers2 = pool_call(Pid, get_idle_workers),
+    ?assertEqual(1, maps:size(IdleWorkers2)),
+    ?assertNot(maps:is_key(A, IdleWorkers2)),
+    ?assert(maps:is_key(B, IdleWorkers2)),
+
+    lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
+process_dies_holding_overflow_worker() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 2, 5000),
+    [A, B, C] = [poolboy:checkout(Pid) || _ <- lists:seq(1, 3)],
+    TestPid = self(),
+
+    Pid1 = spawn(fun() ->
+        Worker = poolboy:checkout(Pid),
+        TestPid ! {worker, Worker},
+        timer:sleep(1000),
+        exit(crash)
+    end),
+
+    OverflowWorker = receive {worker, W} -> W end,
+
+    MonRef = erlang:monitor(process, Pid1),
+    receive
+        {'DOWN', MonRef, process, Pid1, _} -> ok
+    end,
+
+    timer:sleep(1000),
+
+    %% Process goes back to the pool as idle
+    ?assertEqual(1, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
+    ?assert(lists:member(OverflowWorker, [Pid || {_, Pid, _, _} <- pool_call(Pid, get_all_workers)])),
+    ?assert(maps:is_key(OverflowWorker, pool_call(Pid, get_idle_workers))),
+
+    [checkin_worker(Pid, Worker) || Worker <- [A, B, C]],
     ok = pool_call(Pid, stop).
 
 get_monitors(Pid) ->

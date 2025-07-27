@@ -250,6 +250,9 @@ handle_call(get_all_workers, _From, State) ->
     Sup = State#state.supervisor,
     WorkerList = supervisor:which_children(Sup),
     {reply, WorkerList, State};
+handle_call(get_idle_workers, _From, State) ->
+    Workers = State#state.idle_workers,
+    {reply, Workers, State};
 handle_call(get_all_monitors, _From, State) ->
     Monitors = ets:select(State#state.monitors,
                           [{{'$1', '_', '$2'}, [], [{{'$1', '$2'}}]}]),
