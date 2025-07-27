@@ -72,7 +72,21 @@ pool_test_() ->
             {<<"Recover from timeout without exit handling">>,
                 fun transaction_timeout_without_exit/0},
             {<<"Recover from transaction timeout">>,
-                fun transaction_timeout/0}
+                fun transaction_timeout/0},
+            {<<"Idle workers are dismissed after timeout">>,
+                {timeout, 10, fun idle_worker_timeout/0}},
+            {<<"Idle workers are reused before timeout">>,
+                {timeout, 10, fun idle_worker_reuse/0}},
+            {<<"Idle worker timer is cancelled on reuse">>,
+                {timeout, 10, fun idle_worker_timer_cancellation/0}},
+            {<<"Idle workers are removed on death">>,
+                {timeout, 10, fun idle_worker_death/0}},
+            {<<"Multiple idle workers are managed correctly">>,
+                {timeout, 15, fun multiple_idle_workers/0}},
+            {<<"Idle worker behavior with zero overflow">>,
+                fun idle_worker_no_overflow/0},
+            {<<"Idle worker behavior during pool shutdown">>,
+                fun idle_worker_pool_shutdown/0}
         ]
     }.
 
@@ -509,6 +523,150 @@ reuses_waiting_monitor_on_worker_exit() ->
     Pid ! ok,
     ok = pool_call(Pool, stop).
 
+idle_worker_timeout() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 2, 2500),
+
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 4)],
+    ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
+    [A, B, C, D] = Workers,
+
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
+
+    ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
+
+    timer:sleep(3000),
+
+    ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(2, length(pool_call(Pid, get_all_workers))),
+
+    checkin_worker(Pid, C),
+    checkin_worker(Pid, D),
+
+    ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
+
+    ok = pool_call(Pid, stop).
+
+idle_worker_reuse() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 2, 5000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 4)],
+    ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
+
+    [A | Rest] = Workers,
+    checkin_worker(Pid, A),
+    ?assertEqual(1, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
+
+    NewWorker = poolboy:checkout(Pid),
+    ?assertEqual(A, NewWorker),
+    ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
+
+    checkin_worker(Pid, NewWorker),
+    lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
+idle_worker_timer_cancellation() ->
+    {ok, Pid} = new_pool_with_idle_timeout(1, 2, 3000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 3)],
+
+    [A | Rest] = Workers,
+    checkin_worker(Pid, A),
+    timer:sleep(1000),
+
+    ReuseWorker = poolboy:checkout(Pid),
+    ?assertEqual(A, ReuseWorker),
+
+    timer:sleep(4000),
+
+    checkin_worker(Pid, ReuseWorker),
+    ?assertEqual(1, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(3, length(pool_call(Pid, get_all_workers))),
+
+    lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
+idle_worker_death() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 2, 5000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 4)],
+
+    [A, B | Rest] = Workers,
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
+    ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
+
+    kill_worker(A),
+
+    ?assertEqual(1, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(3, length(pool_call(Pid, get_all_workers))),
+
+    lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
+multiple_idle_workers() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 3, 3000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 5)],
+    ?assertEqual(5, length(pool_call(Pid, get_all_workers))),
+
+    [A, B, C | Rest] = Workers,
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
+    checkin_worker(Pid, C),
+    ?assertEqual(3, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(5, length(pool_call(Pid, get_all_workers))),
+
+    ReuseWorker = poolboy:checkout(Pid),
+    ?assert(lists:member(ReuseWorker, [A, B, C])),
+    ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
+
+    timer:sleep(4000),
+
+    ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(3, length(pool_call(Pid, get_all_workers))),
+
+    checkin_worker(Pid, ReuseWorker),
+
+    timer:sleep(4000),
+
+    ?assertEqual(2, length(pool_call(Pid, get_all_workers))),
+
+    lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
+idle_worker_no_overflow() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 0, 2000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 2)],
+    ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(2, length(pool_call(Pid, get_all_workers))),
+
+    [A, B] = Workers,
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
+    ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(2, length(pool_call(Pid, get_all_workers))),
+
+    timer:sleep(3000),
+    ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(2, length(pool_call(Pid, get_all_workers))),
+
+    ok = pool_call(Pid, stop).
+
+idle_worker_pool_shutdown() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 2, 10000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 4)],
+    [A, B | Rest] = Workers,
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
+
+    ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
+
+    lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
 get_monitors(Pid) ->
     %% Synchronise with the Pid to ensure it has handled all expected work.
     _ = sys:get_status(Pid),
@@ -525,6 +683,12 @@ new_pool(Size, MaxOverflow, Strategy) ->
                         {worker_module, poolboy_test_worker},
                         {size, Size}, {max_overflow, MaxOverflow},
                         {strategy, Strategy}]).
+
+new_pool_with_idle_timeout(Size, MaxOverflow, IdleTimeout) ->
+    poolboy:start_link([{name, {local, poolboy_test}},
+                        {worker_module, poolboy_test_worker},
+                        {size, Size}, {max_overflow, MaxOverflow},
+                        {idle_timeout, IdleTimeout}]).
 
 pool_call(ServerRef, Request) ->
     gen_server:call(ServerRef, Request).

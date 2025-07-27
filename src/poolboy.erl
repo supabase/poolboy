@@ -280,15 +280,15 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             NewState = handle_worker_exit(Pid, State),
             {noreply, NewState};
         [] ->
-            % if it was idle, don't restart
             WasIdle = maps:is_key(Pid, State#state.idle_workers),
             W = filter_worker_by_pid(Pid, State#state.workers),
-            I = remove_from_idle(Pid, State#state.idle_workers),
+            % if it was idle, don't restart
             case WasIdle of
                 true ->
-                    {noreply, State#state{workers = queue:in(new_worker(Sup), W), idle_workers = I}};
+                    I = remove_from_idle(Pid, State#state.idle_workers),
+                    {noreply, State#state{workers = W, idle_workers = I}};
                 false ->
-                    {noreply, State#state{workers = W, idle_workers = I}}
+                    {noreply, State#state{workers = queue:in(new_worker(Sup), W)}}
             end
     end;
 
@@ -407,10 +407,10 @@ state_name(_State) ->
     overflow.
 
 remove_from_idle(Pid, IdleWorkers) ->
-    case maps:find(Pid, IdleWorkers) of
-        {ok, Timer} ->
+    case maps:get(Pid, IdleWorkers, undefined) of
+        undefined ->
+            IdleWorkers;
+        Timer ->
             erlang:cancel_timer(Timer),
-            maps:remove(Pid, IdleWorkers);
-        error ->
-            IdleWorkers
+            maps:remove(Pid, IdleWorkers)
     end.
