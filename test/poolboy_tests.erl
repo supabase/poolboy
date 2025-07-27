@@ -90,7 +90,9 @@ pool_test_() ->
             {<<"Idle worker dies while idle">>,
                 {timeout, 10, fun idle_worker_dies_while_idle/0}},
             {<<"Process dies holding overflow worker">>,
-                {timeout, 10, fun process_dies_holding_overflow_worker/0}}
+                {timeout, 10, fun process_dies_holding_overflow_worker/0}},
+            {<<"Process links to worker then crashes">>,
+                {timeout, 10, fun process_links_to_worker_then_crashes/0}}
         ]
     }.
 
@@ -762,10 +764,52 @@ process_dies_holding_overflow_worker() ->
     %% Process goes back to the pool as idle
     ?assertEqual(1, queue:len(pool_call(Pid, get_avail_workers))),
     ?assertEqual(4, length(pool_call(Pid, get_all_workers))),
-    ?assert(lists:member(OverflowWorker, [Pid || {_, Pid, _, _} <- pool_call(Pid, get_all_workers)])),
+    ?assert(lists:member(OverflowWorker, [W || {_, W, _, _} <- pool_call(Pid, get_all_workers)])),
     ?assert(maps:is_key(OverflowWorker, pool_call(Pid, get_idle_workers))),
 
     [checkin_worker(Pid, Worker) || Worker <- [A, B, C]],
+    ok = pool_call(Pid, stop).
+
+process_links_to_worker_then_crashes() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 2, 5000),
+    [A, B] = [poolboy:checkout(Pid) || _ <- lists:seq(1, 2)],
+    ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(2, length(pool_call(Pid, get_all_workers))),
+
+    TestPid = self(),
+
+    Pid1 = spawn(fun() ->
+        Worker = poolboy:checkout(Pid),
+        TestPid ! {worker, Worker},
+        link(Worker),
+        timer:sleep(1000),
+        exit(crash)
+    end),
+
+    LinkedWorker = receive {worker, W} -> W end,
+
+    MonRef = erlang:monitor(process, Pid1),
+    receive
+        {'DOWN', MonRef, process, Pid1, _} -> ok
+    end,
+
+    WorkerMonRef = erlang:monitor(process, LinkedWorker),
+    receive
+        {'DOWN', WorkerMonRef, process, LinkedWorker, _} -> ok
+    after 2000 ->
+        ?assert(false) % Worker should have died due to link
+    end,
+
+    timer:sleep(1000),
+
+    ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(2, length(pool_call(Pid, get_all_workers))),
+    IdleWorkers = pool_call(Pid, get_idle_workers),
+    ?assertEqual(0, maps:size(IdleWorkers)),
+    ?assertNot(lists:member(LinkedWorker, [WPid || {_, WPid, _, _} <- pool_call(Pid, get_all_workers)])),
+
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
     ok = pool_call(Pid, stop).
 
 get_monitors(Pid) ->
