@@ -407,10 +407,10 @@ state_name(_State) ->
     overflow.
 
 remove_from_idle(Pid, IdleWorkers) ->
-    case maps:get(Pid, IdleWorkers, undefined) of
-        undefined ->
+    case maps:take(Pid, IdleWorkers) of
+        error ->
             IdleWorkers;
-        Timer ->
+        {Timer, NewIdleWorkers} ->
             erlang:cancel_timer(Timer),
-            maps:remove(Pid, IdleWorkers)
+            NewIdleWorkers
     end.
