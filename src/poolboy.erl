@@ -10,7 +10,7 @@
          code_change/3]).
 -export_type([pool/0]).
 
--define(TIMEOUT, 5000).
+-define(DEFAULT_TIMEOUT, 5000).
 
 -ifdef(pre17).
 -type pid_queue() :: queue().
@@ -55,7 +55,7 @@ checkout(Pool) ->
 
 -spec checkout(Pool :: pool(), Block :: boolean()) -> pid() | full.
 checkout(Pool, Block) ->
-    checkout(Pool, Block, ?TIMEOUT).
+    checkout(Pool, Block, ?DEFAULT_TIMEOUT).
 
 -spec checkout(Pool :: pool(), Block :: boolean(), Timeout :: timeout())
     -> pid() | full.
@@ -76,7 +76,7 @@ checkin(Pool, Worker) when is_pid(Worker) ->
 -spec transaction(Pool :: pool(), Fun :: fun((Worker :: pid()) -> any()))
     -> any().
 transaction(Pool, Fun) ->
-    transaction(Pool, Fun, ?TIMEOUT).
+    transaction(Pool, Fun, ?DEFAULT_TIMEOUT).
 
 -spec transaction(Pool :: pool(), Fun :: fun((Worker :: pid()) -> any()),
     Timeout :: timeout()) -> any().
@@ -161,7 +161,7 @@ init([{size, Size} | Rest], WorkerArgs, State) when is_integer(Size) ->
 init([{max_overflow, MaxOverflow} | Rest], WorkerArgs, State) when is_integer(MaxOverflow) ->
     init(Rest, WorkerArgs, State#state{max_overflow = MaxOverflow});
 init([{idle_timeout, IdleTimeout} | Rest], WorkerArgs, State) when is_integer(IdleTimeout) ->
-    init(Rest, WorkerArgs, State#state{idle_timeout = IdleTimeout});    
+    init(Rest, WorkerArgs, State#state{idle_timeout = IdleTimeout});
 init([{strategy, lifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = lifo});
 init([{strategy, fifo} | Rest], WorkerArgs, State) ->
@@ -214,14 +214,14 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
            strategy = Strategy} = State,
     case get_worker_with_strategy(Workers, Strategy) of
         {{value, Pid},  Left} ->
-            {NewIdleWorkers, NewOverflow} = 
+            {NewIdleWorkers, NewOverflow} =
                 case maps:get(Pid, IdleWorkers, undefined) of
-                    undefined -> 
+                    undefined ->
                         {IdleWorkers, Overflow};
-                    Timer -> 
-                        erlang:cancel_timer(Timer), 
+                    Timer ->
+                        erlang:cancel_timer(Timer),
                         {maps:remove(Pid, IdleWorkers), Overflow + 1}
-                end,            
+                end,
             MRef = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
             {reply, Pid, State#state{workers = Left, idle_workers = NewIdleWorkers, overflow = NewOverflow}};
@@ -250,6 +250,9 @@ handle_call(get_all_workers, _From, State) ->
     Sup = State#state.supervisor,
     WorkerList = supervisor:which_children(Sup),
     {reply, WorkerList, State};
+handle_call(get_idle_workers, _From, State) ->
+    Workers = State#state.idle_workers,
+    {reply, Workers, State};
 handle_call(get_all_monitors, _From, State) ->
     Monitors = ets:select(State#state.monitors,
                           [{{'$1', '_', '$2'}, [], [{{'$1', '$2'}}]}]),
@@ -280,26 +283,19 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             NewState = handle_worker_exit(Pid, State),
             {noreply, NewState};
         [] ->
-            Q = queue:member(Pid, State#state.workers),
-            case queue:member(Pid, State#state.workers) and maps:is_key(Pid, State#state.idle_workers) of
+            WasIdle = maps:is_key(Pid, State#state.idle_workers),
+            W = filter_worker_by_pid(Pid, State#state.workers),
+            % if it was idle, don't restart
+            case WasIdle of
                 true ->
-                    W = filter_worker_by_pid(Pid, State#state.workers),
-                    {noreply, State#state{workers = queue:in(new_worker(Sup), W)}};
+                    I = remove_from_idle(Pid, State#state.idle_workers),
+                    {noreply, State#state{workers = W, idle_workers = I}};
                 false ->
-                    case queue:member(Pid, State#state.workers) of
-                        true ->
-                            W = filter_worker_by_pid(Pid, State#state.workers),
-                            {noreply, State#state{workers = W}};
-                        false ->
-                            {noreply, State}
-                    end
+                    {noreply, State#state{workers = queue:in(new_worker(Sup), W)}}
             end
     end;
 
-handle_info({dismiss_idle, Pid}, State) ->
-    #state{supervisor = Sup,
-           idle_workers = IdleWorkers,
-           overflow = Overflow} = State,
+handle_info({dismiss_idle, Pid}, #state{supervisor = Sup, idle_workers = IdleWorkers} = State) ->
     ok = dismiss_worker(Sup, Pid),
     NewIdleWorkers = maps:remove(Pid, IdleWorkers),
     Workers = filter_worker_by_pid(Pid, State#state.workers),
@@ -368,11 +364,11 @@ handle_checkin(Pid, State) ->
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
             gen_server:reply(From, Pid),
             State#state{waiting = Left};
-        {empty, Empty} when Overflow > 0 ->        
+        {empty, Empty} when Overflow > 0 ->
             Timer = erlang:send_after(State#state.idle_timeout, self(), {dismiss_idle, Pid}),
             NewIdleWorkers = maps:put(Pid, Timer, IdleWorkers),
             Workers = queue:in(Pid, State#state.workers),
-            State#state{workers = Workers, waiting = Empty, overflow = Overflow - 1, idle_workers = NewIdleWorkers};                     
+            State#state{workers = Workers, waiting = Empty, overflow = Overflow - 1, idle_workers = NewIdleWorkers};
         {empty, Empty} ->
             Workers = queue:in(Pid, State#state.workers),
             State#state{workers = Workers, waiting = Empty, overflow = 0}
@@ -383,13 +379,7 @@ handle_worker_exit(Pid, State) ->
            monitors = Monitors,
            idle_workers = IdleWorkers,
            overflow = Overflow} = State,
-    NewIdleWorkers = case maps:get(Pid, IdleWorkers, undefined) of
-            undefined ->
-                IdleWorkers;
-            ref ->
-                erlang:cancel_timer(ref),
-                maps:remove(Pid, IdleWorkers)
-        end,    
+    NewIdleWorkers = remove_from_idle(Pid, IdleWorkers),
     case queue:out(State#state.waiting) of
         {{value, {From, CRef, MRef}}, LeftWaiting} ->
             NewWorker = new_worker(State#state.supervisor),
@@ -415,3 +405,12 @@ state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
     full;
 state_name(_State) ->
     overflow.
+
+remove_from_idle(Pid, IdleWorkers) ->
+    case maps:take(Pid, IdleWorkers) of
+        error ->
+            IdleWorkers;
+        {Timer, NewIdleWorkers} ->
+            erlang:cancel_timer(Timer),
+            NewIdleWorkers
+    end.

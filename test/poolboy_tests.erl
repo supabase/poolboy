@@ -72,7 +72,25 @@ pool_test_() ->
             {<<"Recover from timeout without exit handling">>,
                 fun transaction_timeout_without_exit/0},
             {<<"Recover from transaction timeout">>,
-                fun transaction_timeout/0}
+                fun transaction_timeout/0},
+            {<<"Idle workers are dismissed after timeout">>,
+                {timeout, 10, fun idle_worker_timeout/0}},
+            {<<"Idle workers are reused before timeout">>,
+                {timeout, 10, fun idle_worker_reuse/0}},
+            {<<"Idle worker timer is cancelled on reuse">>,
+                {timeout, 10, fun idle_worker_timer_cancellation/0}},
+            {<<"Idle workers are removed on death">>,
+                {timeout, 10, fun idle_worker_death/0}},
+            {<<"Multiple idle workers are managed correctly">>,
+                {timeout, 15, fun multiple_idle_workers/0}},
+            {<<"Idle worker behavior with zero overflow">>,
+                fun idle_worker_no_overflow/0},
+            {<<"Idle worker behavior during pool shutdown">>,
+                fun idle_worker_pool_shutdown/0},
+            {<<"Process dies holding overflow worker">>,
+                {timeout, 10, fun process_dies_holding_overflow_worker/0}},
+            {<<"Process links to worker then crashes">>,
+                {timeout, 10, fun process_links_to_worker_then_crashes/0}}
         ]
     }.
 
@@ -143,23 +161,16 @@ pool_overflow() ->
     Workers = [poolboy:checkout(Pid) || _ <- lists:seq(0, 6)],
     ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
     ?assertEqual(7, length(pool_call(Pid, get_all_workers))),
-    [A, B, C, D, E, F, G] = Workers,
+    [A, B, C, D, _E, _F, _G] = Workers,
     checkin_worker(Pid, A),
     checkin_worker(Pid, B),
-    ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
-    ?assertEqual(5, length(pool_call(Pid, get_all_workers))),
+    %% different from original poolboy, we keep the returned workers for a while
+    ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(7, length(pool_call(Pid, get_all_workers))),
     checkin_worker(Pid, C),
     checkin_worker(Pid, D),
-    ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
-    ?assertEqual(5, length(pool_call(Pid, get_all_workers))),
-    checkin_worker(Pid, E),
-    checkin_worker(Pid, F),
     ?assertEqual(4, queue:len(pool_call(Pid, get_avail_workers))),
-    ?assertEqual(5, length(pool_call(Pid, get_all_workers))),
-    checkin_worker(Pid, G),
-    ?assertEqual(5, queue:len(pool_call(Pid, get_avail_workers))),
-    ?assertEqual(5, length(pool_call(Pid, get_all_workers))),
-    ?assertEqual(0, length(pool_call(Pid, get_all_monitors))),
+    ?assertEqual(7, length(pool_call(Pid, get_all_workers))),
     ok = pool_call(Pid, stop).
 
 pool_empty() ->
@@ -169,7 +180,7 @@ pool_empty() ->
     Workers = [poolboy:checkout(Pid) || _ <- lists:seq(0, 6)],
     ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
     ?assertEqual(7, length(pool_call(Pid, get_all_workers))),
-    [A, B, C, D, E, F, G] = Workers,
+    [A, B, _C, _D, _E, _F, _G] = Workers,
     Self = self(),
     spawn(fun() ->
         Worker = poolboy:checkout(Pid),
@@ -192,20 +203,8 @@ pool_empty() ->
     after
         500 -> ?assert(false)
     end,
-    ?assertEqual(0, queue:len(pool_call(Pid, get_avail_workers))),
-    ?assertEqual(5, length(pool_call(Pid, get_all_workers))),
-    checkin_worker(Pid, C),
-    checkin_worker(Pid, D),
     ?assertEqual(2, queue:len(pool_call(Pid, get_avail_workers))),
-    ?assertEqual(5, length(pool_call(Pid, get_all_workers))),
-    checkin_worker(Pid, E),
-    checkin_worker(Pid, F),
-    ?assertEqual(4, queue:len(pool_call(Pid, get_avail_workers))),
-    ?assertEqual(5, length(pool_call(Pid, get_all_workers))),
-    checkin_worker(Pid, G),
-    ?assertEqual(5, queue:len(pool_call(Pid, get_avail_workers))),
-    ?assertEqual(5, length(pool_call(Pid, get_all_workers))),
-    ?assertEqual(0, length(pool_call(Pid, get_all_monitors))),
+    ?assertEqual(7, length(pool_call(Pid, get_all_workers))),
     ok = pool_call(Pid, stop).
 
 pool_empty_no_overflow() ->
@@ -380,7 +379,6 @@ pool_full_nonblocking() ->
     A = hd(Workers),
     checkin_worker(Pid, A),
     NewWorker = poolboy:checkout(Pid, false),
-    ?assertEqual(false, is_process_alive(A)), %% Overflow workers get shutdown
     ?assert(is_pid(NewWorker)),
     ?assertEqual(full, poolboy:checkout(Pid, false)),
     ?assertEqual(10, length(pool_call(Pid, get_all_monitors))),
@@ -529,6 +527,265 @@ reuses_waiting_monitor_on_worker_exit() ->
     Pid ! ok,
     ok = pool_call(Pool, stop).
 
+idle_worker_timeout() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 2, 2500),
+
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 4)],
+    assert_avail_workers_exactly(Pid, []),
+    assert_all_workers_exactly(Pid, Workers),
+    [A, B, C, D] = Workers,
+
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
+
+    %% A and B should be available and idle
+    assert_avail_workers_exactly(Pid, [A, B]),
+    assert_all_workers_exactly(Pid, Workers),
+    assert_idle_workers_exactly(Pid, [A, B]),
+
+    timer:sleep(3000),
+
+    %% A and B should have timed out and been removed
+    assert_avail_workers_exactly(Pid, []),
+    assert_all_workers_exactly(Pid, [C, D]),
+    assert_idle_workers_exactly(Pid, []),
+
+    checkin_worker(Pid, C),
+    checkin_worker(Pid, D),
+
+    %% C and D should now be available
+    assert_avail_workers_exactly(Pid, [C, D]),
+
+    ok = pool_call(Pid, stop).
+
+idle_worker_reuse() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 2, 5000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 4)],
+    assert_all_workers_exactly(Pid, Workers),
+
+    [A | Rest] = Workers,
+    checkin_worker(Pid, A),
+    %% A should be the only available and idle worker
+    assert_avail_workers_exactly(Pid, [A]),
+    assert_all_workers_exactly(Pid, Workers),
+    assert_idle_workers_exactly(Pid, [A]),
+
+    NewWorker = poolboy:checkout(Pid),
+    %% Should reuse the same worker A
+    ?assertEqual(A, NewWorker),
+    assert_avail_workers_exactly(Pid, []),
+    assert_all_workers_exactly(Pid, Workers),
+    assert_idle_workers_exactly(Pid, []),
+
+    checkin_worker(Pid, NewWorker),
+    lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
+idle_worker_timer_cancellation() ->
+    {ok, Pid} = new_pool_with_idle_timeout(1, 2, 3000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 3)],
+
+    [A | Rest] = Workers,
+    checkin_worker(Pid, A),
+    %% A should be the only available and idle worker
+    assert_avail_workers_exactly(Pid, [A]),
+    assert_idle_workers_exactly(Pid, [A]),
+    timer:sleep(1000),
+
+    ReuseWorker = poolboy:checkout(Pid),
+    %% Should reuse worker A and cancel its timer
+    ?assertEqual(A, ReuseWorker),
+    assert_avail_workers_exactly(Pid, []),
+    assert_idle_workers_exactly(Pid, []),
+
+    timer:sleep(4000),
+
+    checkin_worker(Pid, ReuseWorker),
+    %% ReuseWorker should be available and idle, all original workers should still exist
+    assert_avail_workers_exactly(Pid, [ReuseWorker]),
+    assert_all_workers_exactly(Pid, Workers),
+    assert_idle_workers_exactly(Pid, [ReuseWorker]),
+
+    lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
+multiple_idle_workers() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 3, 3000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 5)],
+    assert_all_workers_exactly(Pid, Workers),
+
+    [A, B, C | Rest] = Workers,
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
+    checkin_worker(Pid, C),
+    %% A, B, C should all be available and idle
+    assert_avail_workers_exactly(Pid, [A, B, C]),
+    assert_all_workers_exactly(Pid, Workers),
+    assert_idle_workers_exactly(Pid, [A, B, C]),
+
+    ReuseWorker = poolboy:checkout(Pid),
+    ?assert(lists:member(ReuseWorker, [A, B, C])),
+    %% Two workers should remain available and idle (the ones not reused)
+    RemainingIdle = [W || W <- [A, B, C], W =/= ReuseWorker],
+    assert_avail_workers_exactly(Pid, RemainingIdle),
+    assert_idle_workers_exactly(Pid, RemainingIdle),
+
+    timer:sleep(4000),
+
+    %% After timeout, idle workers should be dismissed, leaving only active workers + reused worker
+    ActiveWorkers = Rest ++ [ReuseWorker],
+    assert_avail_workers_exactly(Pid, []),
+    assert_all_workers_exactly(Pid, ActiveWorkers),
+    assert_idle_workers_exactly(Pid, []),
+
+    checkin_worker(Pid, ReuseWorker),
+    %% ReuseWorker should now be the only available and idle worker
+    assert_idle_workers_exactly(Pid, [ReuseWorker]),
+
+    timer:sleep(4000),
+
+    %% After second timeout, reused worker should also be dismissed
+    assert_all_workers_exactly(Pid, Rest),
+    assert_idle_workers_exactly(Pid, []),
+
+    lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
+idle_worker_no_overflow() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 0, 2000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 2)],
+    assert_avail_workers_exactly(Pid, []),
+    assert_all_workers_exactly(Pid, Workers),
+
+    [A, B] = Workers,
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
+    %% With no overflow, idle workers should not be tracked for timeout
+    assert_avail_workers_exactly(Pid, [A, B]),
+    assert_all_workers_exactly(Pid, Workers),
+    assert_idle_workers_exactly(Pid, []),
+
+    timer:sleep(3000),
+    %% Workers should still be available since no overflow means no idle timeout
+    assert_avail_workers_exactly(Pid, [A, B]),
+    assert_all_workers_exactly(Pid, Workers),
+    assert_idle_workers_exactly(Pid, []),
+
+    ok = pool_call(Pid, stop).
+
+idle_worker_pool_shutdown() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 2, 10000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 4)],
+    [A, B | Rest] = Workers,
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
+
+    %% A and B should be available and idle
+    assert_avail_workers_exactly(Pid, [A, B]),
+    assert_all_workers_exactly(Pid, Workers),
+
+    lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
+idle_worker_dies_while_idle() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 2, 5000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 4)],
+    assert_avail_workers_exactly(Pid, []),
+    assert_all_workers_exactly(Pid, Workers),
+
+    [A, B | Rest] = Workers,
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
+    %% A and B should be available and idle
+    assert_avail_workers_exactly(Pid, [A, B]),
+    assert_all_workers_exactly(Pid, Workers),
+    assert_idle_workers_exactly(Pid, [A, B]),
+
+    kill_worker(A),
+    timer:sleep(1000),
+
+    %% After A dies, only B should remain available and idle, A should be removed
+    RemainingWorkers = [B | Rest],
+    assert_avail_workers_exactly(Pid, [B]),
+    assert_all_workers_exactly(Pid, RemainingWorkers),
+    assert_idle_workers_exactly(Pid, [B]),
+
+    lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
+process_dies_holding_overflow_worker() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 2, 5000),
+    [A, B, C] = [poolboy:checkout(Pid) || _ <- lists:seq(1, 3)],
+    TestPid = self(),
+
+    Pid1 = spawn(fun() ->
+        Worker = poolboy:checkout(Pid),
+        TestPid ! {worker, Worker},
+        timer:sleep(1000),
+        exit(crash)
+    end),
+
+    OverflowWorker = receive {worker, W} -> W end,
+
+    MonRef = erlang:monitor(process, Pid1),
+    receive
+        {'DOWN', MonRef, process, Pid1, _} -> ok
+    end,
+
+    timer:sleep(1000),
+
+    %% Overflow worker should be returned to pool as idle after process death
+    AllWorkers = [A, B, C, OverflowWorker],
+    assert_avail_workers_exactly(Pid, [OverflowWorker]),
+    assert_all_workers_exactly(Pid, AllWorkers),
+    assert_idle_workers_exactly(Pid, [OverflowWorker]),
+
+    [checkin_worker(Pid, Worker) || Worker <- [A, B, C]],
+    ok = pool_call(Pid, stop).
+
+process_links_to_worker_then_crashes() ->
+    {ok, Pid} = new_pool_with_idle_timeout(2, 2, 5000),
+    [A, B] = [poolboy:checkout(Pid) || _ <- lists:seq(1, 2)],
+    assert_avail_workers_exactly(Pid, []),
+    assert_all_workers_exactly(Pid, [A, B]),
+
+    TestPid = self(),
+
+    Pid1 = spawn(fun() ->
+        Worker = poolboy:checkout(Pid),
+        TestPid ! {worker, Worker},
+        link(Worker),
+        timer:sleep(1000),
+        exit(crash)
+    end),
+
+    LinkedWorker = receive {worker, W} -> W end,
+
+    MonRef = erlang:monitor(process, Pid1),
+    receive
+        {'DOWN', MonRef, process, Pid1, _} -> ok
+    end,
+
+    WorkerMonRef = erlang:monitor(process, LinkedWorker),
+    receive
+        {'DOWN', WorkerMonRef, process, LinkedWorker, _} -> ok
+    after 2000 ->
+        ?assert(false) % Worker should have died due to link
+    end,
+
+    timer:sleep(1000),
+
+    %% After linked worker dies, it should be removed from pool, leaving only A and B
+    assert_avail_workers_exactly(Pid, []),
+    assert_all_workers_exactly(Pid, [A, B]),
+    assert_idle_workers_exactly(Pid, []),
+    AllWorkerPids = all_workers_pids(Pid),
+    ?assertNot(lists:member(LinkedWorker, AllWorkerPids)),
+
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
+    ok = pool_call(Pid, stop).
+
 get_monitors(Pid) ->
     %% Synchronise with the Pid to ensure it has handled all expected work.
     _ = sys:get_status(Pid),
@@ -546,5 +803,60 @@ new_pool(Size, MaxOverflow, Strategy) ->
                         {size, Size}, {max_overflow, MaxOverflow},
                         {strategy, Strategy}]).
 
+new_pool_with_idle_timeout(Size, MaxOverflow, IdleTimeout) ->
+    poolboy:start_link([{name, {local, poolboy_test}},
+                        {worker_module, poolboy_test_worker},
+                        {size, Size}, {max_overflow, MaxOverflow},
+                        {idle_timeout, IdleTimeout}]).
+
 pool_call(ServerRef, Request) ->
     gen_server:call(ServerRef, Request).
+
+%% Helper functions for more assertive testing
+avail_workers_to_list(Pool) ->
+    AvailQueue = pool_call(Pool, get_avail_workers),
+    queue:to_list(AvailQueue).
+
+all_workers_pids(Pool) ->
+    AllWorkers = pool_call(Pool, get_all_workers),
+    [Pid || {_, Pid, _, _} <- AllWorkers].
+
+idle_workers_pids(Pool) ->
+    IdleWorkers = pool_call(Pool, get_idle_workers),
+    maps:keys(IdleWorkers).
+
+assert_avail_workers_exactly(Pool, ExpectedWorkers) ->
+    ActualWorkers = avail_workers_to_list(Pool),
+    ?assertEqual(lists:sort(ExpectedWorkers), lists:sort(ActualWorkers)).
+
+assert_avail_workers_contains(Pool, Workers) ->
+    AvailWorkers = avail_workers_to_list(Pool),
+    lists:foreach(fun(Worker) ->
+        ?assert(lists:member(Worker, AvailWorkers))
+    end, Workers).
+
+assert_avail_workers_does_not_contain(Pool, Workers) ->
+    AvailWorkers = avail_workers_to_list(Pool),
+    lists:foreach(fun(Worker) ->
+        ?assertNot(lists:member(Worker, AvailWorkers))
+    end, Workers).
+
+assert_all_workers_exactly(Pool, ExpectedWorkers) ->
+    ActualWorkers = all_workers_pids(Pool),
+    ?assertEqual(lists:sort(ExpectedWorkers), lists:sort(ActualWorkers)).
+
+assert_idle_workers_exactly(Pool, ExpectedWorkers) ->
+    ActualWorkers = idle_workers_pids(Pool),
+    ?assertEqual(lists:sort(ExpectedWorkers), lists:sort(ActualWorkers)).
+
+assert_idle_workers_contains(Pool, Workers) ->
+    IdleWorkers = idle_workers_pids(Pool),
+    lists:foreach(fun(Worker) ->
+        ?assert(lists:member(Worker, IdleWorkers))
+    end, Workers).
+
+assert_idle_workers_does_not_contain(Pool, Workers) ->
+    IdleWorkers = idle_workers_pids(Pool),
+    lists:foreach(fun(Worker) ->
+        ?assertNot(lists:member(Worker, IdleWorkers))
+    end, Workers).
