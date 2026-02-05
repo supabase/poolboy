@@ -10,7 +10,9 @@ pool_test_() ->
         fun(_) ->
             case whereis(poolboy_test) of
                 undefined -> ok;
-                Pid -> pool_call(Pid, stop)
+                Pid ->
+                    catch pool_call(Pid, stop),
+                    wait_for_exit(Pid)
             end,
             error_logger:tty(true)
         end,
@@ -80,7 +82,7 @@ pool_test_() ->
             {<<"Idle worker timer is cancelled on reuse">>,
                 {timeout, 10, fun idle_worker_timer_cancellation/0}},
             {<<"Idle workers are removed on death">>,
-                {timeout, 10, fun idle_worker_death/0}},
+                {timeout, 10, fun idle_worker_dies_while_idle/0}},
             {<<"Multiple idle workers are managed correctly">>,
                 {timeout, 15, fun multiple_idle_workers/0}},
             {<<"Idle worker behavior with zero overflow">>,
@@ -786,28 +788,47 @@ process_links_to_worker_then_crashes() ->
     checkin_worker(Pid, B),
     ok = pool_call(Pid, stop).
 
-get_monitors(Pid) ->
+get_monitors(Pool) ->
+    Pid = resolve_pid(Pool),
     %% Synchronise with the Pid to ensure it has handled all expected work.
     _ = sys:get_status(Pid),
     [{monitors, Monitors}] = erlang:process_info(Pid, [monitors]),
     Monitors.
 
+resolve_pid(Pid) when is_pid(Pid) -> Pid;
+resolve_pid(Name) when is_atom(Name) -> whereis(Name).
+
+wait_for_exit(Pid) ->
+    MRef = erlang:monitor(process, Pid),
+    receive
+        {'DOWN', MRef, process, Pid, _} -> ok
+    after 5000 ->
+        erlang:demonitor(MRef, [flush]),
+        ok
+    end.
+
 new_pool(Size, MaxOverflow) ->
-    poolboy:start_link([{name, {local, poolboy_test}},
+    {ok, SupPid} = poolboy:start_link([{name, {local, poolboy_test}},
                         {worker_module, poolboy_test_worker},
-                        {size, Size}, {max_overflow, MaxOverflow}]).
+                        {size, Size}, {max_overflow, MaxOverflow}], []),
+    unlink(SupPid),
+    {ok, poolboy_test}.
 
 new_pool(Size, MaxOverflow, Strategy) ->
-    poolboy:start_link([{name, {local, poolboy_test}},
+    {ok, SupPid} = poolboy:start_link([{name, {local, poolboy_test}},
                         {worker_module, poolboy_test_worker},
                         {size, Size}, {max_overflow, MaxOverflow},
-                        {strategy, Strategy}]).
+                        {strategy, Strategy}], []),
+    unlink(SupPid),
+    {ok, poolboy_test}.
 
 new_pool_with_idle_timeout(Size, MaxOverflow, IdleTimeout) ->
-    poolboy:start_link([{name, {local, poolboy_test}},
+    {ok, SupPid} = poolboy:start_link([{name, {local, poolboy_test}},
                         {worker_module, poolboy_test_worker},
                         {size, Size}, {max_overflow, MaxOverflow},
-                        {idle_timeout, IdleTimeout}]).
+                        {idle_timeout, IdleTimeout}], []),
+    unlink(SupPid),
+    {ok, poolboy_test}.
 
 pool_call(ServerRef, Request) ->
     gen_server:call(ServerRef, Request).
@@ -829,18 +850,6 @@ assert_avail_workers_exactly(Pool, ExpectedWorkers) ->
     ActualWorkers = avail_workers_to_list(Pool),
     ?assertEqual(lists:sort(ExpectedWorkers), lists:sort(ActualWorkers)).
 
-assert_avail_workers_contains(Pool, Workers) ->
-    AvailWorkers = avail_workers_to_list(Pool),
-    lists:foreach(fun(Worker) ->
-        ?assert(lists:member(Worker, AvailWorkers))
-    end, Workers).
-
-assert_avail_workers_does_not_contain(Pool, Workers) ->
-    AvailWorkers = avail_workers_to_list(Pool),
-    lists:foreach(fun(Worker) ->
-        ?assertNot(lists:member(Worker, AvailWorkers))
-    end, Workers).
-
 assert_all_workers_exactly(Pool, ExpectedWorkers) ->
     ActualWorkers = all_workers_pids(Pool),
     ?assertEqual(lists:sort(ExpectedWorkers), lists:sort(ActualWorkers)).
@@ -849,14 +858,3 @@ assert_idle_workers_exactly(Pool, ExpectedWorkers) ->
     ActualWorkers = idle_workers_pids(Pool),
     ?assertEqual(lists:sort(ExpectedWorkers), lists:sort(ActualWorkers)).
 
-assert_idle_workers_contains(Pool, Workers) ->
-    IdleWorkers = idle_workers_pids(Pool),
-    lists:foreach(fun(Worker) ->
-        ?assert(lists:member(Worker, IdleWorkers))
-    end, Workers).
-
-assert_idle_workers_does_not_contain(Pool, Workers) ->
-    IdleWorkers = idle_workers_pids(Pool),
-    lists:foreach(fun(Worker) ->
-        ?assertNot(lists:member(Worker, IdleWorkers))
-    end, Workers).

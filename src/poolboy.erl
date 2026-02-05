@@ -4,10 +4,10 @@
 -behaviour(gen_server).
 
 -export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
-         transaction/3, child_spec/2, child_spec/3, start/1,
-         start/2, start_link/1, start_link/2, stop/1, status/1]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
-         code_change/3]).
+         transaction/3, child_spec/2, child_spec/3,
+         start_link/2, start_link_worker/2, stop/1, status/1]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+         handle_continue/2, terminate/2, code_change/3]).
 -export_type([pool/0]).
 
 -define(DEFAULT_TIMEOUT, 5000).
@@ -89,65 +89,42 @@ child_spec(PoolId, PoolArgs, WorkerArgs) ->
     #{id => PoolId,
       start => {poolboy, start_link, [PoolArgs, WorkerArgs]},
       restart => permanent,
-      shutdown => 5000,
-      type => worker,
-      modules => [poolboy]}.
-
--spec start(PoolArgs :: proplists:proplist())
-    -> start_ret().
-start(PoolArgs) ->
-    start(PoolArgs, PoolArgs).
-
--spec start(PoolArgs :: proplists:proplist(),
-            WorkerArgs:: proplists:proplist())
-    -> start_ret().
-start(PoolArgs, WorkerArgs) ->
-    start_pool(start, PoolArgs, WorkerArgs).
-
--spec start_link(PoolArgs :: proplists:proplist())
-    -> start_ret().
-start_link(PoolArgs)  ->
-    %% for backwards compatability, pass the pool args as the worker args as well
-    start_link(PoolArgs, PoolArgs).
+      shutdown => infinity,
+      type => supervisor,
+      modules => [poolboy, poolboy_sup, poolboy_top_sup]}.
 
 -spec start_link(PoolArgs :: proplists:proplist(),
                  WorkerArgs:: proplists:proplist())
     -> start_ret().
 start_link(PoolArgs, WorkerArgs)  ->
-    start_pool(start_link, PoolArgs, WorkerArgs).
+    poolboy_top_sup:start_link(PoolArgs, WorkerArgs).
+
+-spec start_link_worker(Name :: pool(), PoolArgs :: proplists:proplist())
+    -> start_ret().
+start_link_worker(Name, PoolArgs) ->
+    gen_server:start_link(Name, ?MODULE, PoolArgs, []).
 
 -spec stop(Pool :: pool()) -> ok.
 stop(Pool) ->
-    gen_server:call(Pool, stop).
+    {ok, SupPid} = gen_server:call(Pool, get_top_sup),
+    gen_server:stop(SupPid).
 
 -spec status(Pool :: pool()) -> {atom(), integer(), integer(), integer()}.
 status(Pool) ->
     gen_server:call(Pool, status).
 
-init({PoolArgs, WorkerArgs}) ->
+init(PoolArgs) ->
     process_flag(trap_exit, true),
     Waiting = queue:new(),
     Monitors = ets:new(monitors, [private]),
-    init(PoolArgs, WorkerArgs, #state{waiting = Waiting, monitors = Monitors}).
+    State = parse_opts(PoolArgs, #state{waiting = Waiting, monitors = Monitors}),
+    {ok, State, {continue, init}}.
 
-init([{worker_module, Mod} | Rest], WorkerArgs, State) when is_atom(Mod) ->
-    {ok, Sup} = poolboy_sup:start_link(Mod, WorkerArgs),
-    init(Rest, WorkerArgs, State#state{supervisor = Sup});
-init([{size, Size} | Rest], WorkerArgs, State) when is_integer(Size) ->
-    init(Rest, WorkerArgs, State#state{size = Size});
-init([{max_overflow, MaxOverflow} | Rest], WorkerArgs, State) when is_integer(MaxOverflow) ->
-    init(Rest, WorkerArgs, State#state{max_overflow = MaxOverflow});
-init([{idle_timeout, IdleTimeout} | Rest], WorkerArgs, State) when is_integer(IdleTimeout) ->
-    init(Rest, WorkerArgs, State#state{idle_timeout = IdleTimeout});
-init([{strategy, lifo} | Rest], WorkerArgs, State) ->
-    init(Rest, WorkerArgs, State#state{strategy = lifo});
-init([{strategy, fifo} | Rest], WorkerArgs, State) ->
-    init(Rest, WorkerArgs, State#state{strategy = fifo});
-init([_ | Rest], WorkerArgs, State) ->
-    init(Rest, WorkerArgs, State);
-init([], _WorkerArgs, #state{size = Size, supervisor = Sup} = State) ->
+handle_continue(init, State) ->
+    #state{size = Size} = State,
+    Sup = find_worker_sup(),
     Workers = prepopulate(Size, Sup),
-    {ok, State#state{workers = Workers}}.
+    {noreply, State#state{supervisor = Sup, workers = Workers}}.
 
 handle_cast({checkin, Pid}, State = #state{monitors = Monitors}) ->
     case ets:lookup(Monitors, Pid) of
@@ -234,6 +211,10 @@ handle_call(get_all_monitors, _From, State) ->
     Monitors = ets:select(State#state.monitors,
                           [{{'$1', '_', '$2'}, [], [{{'$1', '$2'}}]}]),
     {reply, Monitors, State};
+handle_call(get_top_sup, _From, State) ->
+    {dictionary, Dict} = process_info(self(), dictionary),
+    [Parent | _] = proplists:get_value('$ancestors', Dict),
+    {reply, {ok, Parent}, State};
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
 handle_call(_Msg, _From, State) ->
@@ -285,19 +266,32 @@ handle_info(_Info, State) ->
 terminate(_Reason, State) ->
     Workers = queue:to_list(State#state.workers),
     ok = lists:foreach(fun (W) -> unlink(W) end, Workers),
-    true = exit(State#state.supervisor, shutdown),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-start_pool(StartFun, PoolArgs, WorkerArgs) ->
-    case proplists:get_value(name, PoolArgs) of
-        undefined ->
-            gen_server:StartFun(?MODULE, {PoolArgs, WorkerArgs}, []);
-        Name ->
-            gen_server:StartFun(Name, ?MODULE, {PoolArgs, WorkerArgs}, [])
-    end.
+parse_opts([{size, Size} | Rest], State) when is_integer(Size) ->
+    parse_opts(Rest, State#state{size = Size});
+parse_opts([{max_overflow, MaxOverflow} | Rest], State) when is_integer(MaxOverflow) ->
+    parse_opts(Rest, State#state{max_overflow = MaxOverflow});
+parse_opts([{idle_timeout, IdleTimeout} | Rest], State) when is_integer(IdleTimeout) ->
+    parse_opts(Rest, State#state{idle_timeout = IdleTimeout});
+parse_opts([{strategy, lifo} | Rest], State) ->
+    parse_opts(Rest, State#state{strategy = lifo});
+parse_opts([{strategy, fifo} | Rest], State) ->
+    parse_opts(Rest, State#state{strategy = fifo});
+parse_opts([_ | Rest], State) ->
+    parse_opts(Rest, State);
+parse_opts([], State) ->
+    State.
+
+find_worker_sup() ->
+    {dictionary, Dict} = process_info(self(), dictionary),
+    [Parent | _] = proplists:get_value('$ancestors', Dict),
+    Children = supervisor:which_children(Parent),
+    {poolboy_sup, Pid, _, _} = lists:keyfind(poolboy_sup, 1, Children),
+    Pid.
 
 new_worker(Sup) ->
     {ok, Pid} = supervisor:start_child(Sup, []),
