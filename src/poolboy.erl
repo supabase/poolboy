@@ -4,7 +4,7 @@
 -behaviour(gen_server).
 
 -export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
-         transaction/3, child_spec/2, child_spec/3, child_spec/4, start/1,
+         transaction/3, child_spec/2, child_spec/3, start/1,
          start/2, start_link/1, start_link/2, stop/1, status/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
@@ -12,19 +12,7 @@
 
 -define(DEFAULT_TIMEOUT, 5000).
 
--ifdef(pre17).
--type pid_queue() :: queue().
--else.
 -type pid_queue() :: queue:queue().
--endif.
-
--ifdef(OTP_RELEASE). %% this implies 21 or higher
--define(EXCEPTION(Class, Reason, Stacktrace), Class:Reason:Stacktrace).
--define(GET_STACK(Stacktrace), Stacktrace).
--else.
--define(EXCEPTION(Class, Reason, _), Class:Reason).
--define(GET_STACK(_), erlang:get_stacktrace()).
--endif.
 
 -type pool() ::
     Name :: (atom() | pid()) |
@@ -64,9 +52,9 @@ checkout(Pool, Block, Timeout) ->
     try
         gen_server:call(Pool, {checkout, CRef, Block}, Timeout)
     catch
-        ?EXCEPTION(Class, Reason, Stacktrace) ->
+        Class:Reason:Stacktrace ->
             gen_server:cast(Pool, {cancel_waiting, CRef}),
-            erlang:raise(Class, Reason, ?GET_STACK(Stacktrace))
+            erlang:raise(Class, Reason, Stacktrace)
     end.
 
 -spec checkin(Pool :: pool(), Worker :: pid()) -> ok.
@@ -98,17 +86,6 @@ child_spec(PoolId, PoolArgs) ->
                  WorkerArgs :: proplists:proplist())
     -> supervisor:child_spec().
 child_spec(PoolId, PoolArgs, WorkerArgs) ->
-    child_spec(PoolId, PoolArgs, WorkerArgs, tuple).
-
--spec child_spec(PoolId :: term(),
-                 PoolArgs :: proplists:proplist(),
-                 WorkerArgs :: proplists:proplist(),
-                 ChildSpecFormat :: 'tuple' | 'map')
-    -> supervisor:child_spec().
-child_spec(PoolId, PoolArgs, WorkerArgs, tuple) ->
-    {PoolId, {poolboy, start_link, [PoolArgs, WorkerArgs]},
-     permanent, 5000, worker, [poolboy]};
-child_spec(PoolId, PoolArgs, WorkerArgs, map) ->
     #{id => PoolId,
       start => {poolboy, start_link, [PoolArgs, WorkerArgs]},
       restart => permanent,
