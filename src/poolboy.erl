@@ -212,8 +212,7 @@ handle_call(get_all_monitors, _From, State) ->
                           [{{'$1', '_', '$2'}, [], [{{'$1', '$2'}}]}]),
     {reply, Monitors, State};
 handle_call(get_top_sup, _From, State) ->
-    {dictionary, Dict} = process_info(self(), dictionary),
-    [Parent | _] = proplists:get_value('$ancestors', Dict),
+    [Parent | _] = get('$ancestors'),
     {reply, {ok, Parent}, State};
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
@@ -287,8 +286,7 @@ parse_opts([], State) ->
     State.
 
 find_worker_sup() ->
-    {dictionary, Dict} = process_info(self(), dictionary),
-    [Parent | _] = proplists:get_value('$ancestors', Dict),
+    [Parent | _] = get('$ancestors'),
     Children = supervisor:which_children(Parent),
     {poolboy_sup, Pid, _, _} = lists:keyfind(poolboy_sup, 1, Children),
     Pid.
