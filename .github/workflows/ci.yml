@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        otp-version: ['25', '26', '27']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp-version }}
+          rebar3-version: '3.24'
+
+      - run: rebar3 eunit
+
+  dialyzer:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+          rebar3-version: '3.24'
+
+      - uses: actions/cache@v4
+        with:
+          path: _build/default/rebar3_*_plt
+          key: dialyzer-${{ hashFiles('rebar.lock') }}-otp27
+
+      - run: rebar3 dialyzer
