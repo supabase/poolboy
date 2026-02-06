@@ -92,7 +92,9 @@ pool_test_() ->
             {<<"Process dies holding overflow worker">>,
                 {timeout, 10, fun process_dies_holding_overflow_worker/0}},
             {<<"Process links to worker then crashes">>,
-                {timeout, 10, fun process_links_to_worker_then_crashes/0}}
+                {timeout, 10, fun process_links_to_worker_then_crashes/0}},
+            {<<"Pool requires a name">>,
+                fun pool_missing_name/0}
         ]
     }.
 
@@ -143,6 +145,11 @@ transaction_timeout() ->
     ?assertEqual(WorkerList, pool_call(Pid, get_all_workers)),
     ?assertEqual({ready,1,0,0}, pool_call(Pid, status)).
 
+
+pool_missing_name() ->
+    ?assertEqual({error, {missing_option, name}},
+                 poolboy:start_link([{worker_module, poolboy_test_worker},
+                                     {size, 1}, {max_overflow, 0}], [])).
 
 pool_startup() ->
     %% Check basic pool operation.
