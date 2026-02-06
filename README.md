@@ -1,11 +1,30 @@
 # Poolboy - A hunky Erlang worker pool factory
 
-[![Build Status](https://api.travis-ci.org/devinus/poolboy.svg?branch=master)](https://travis-ci.org/devinus/poolboy)
-
-[![Support via Gratipay](https://cdn.rawgit.com/gratipay/gratipay-badge/2.3.0/dist/gratipay.png)](https://gratipay.com/devinus/)
-
 Poolboy is a **lightweight**, **generic** pooling library for Erlang with a
 focus on **simplicity**, **performance**, and **rock-solid** disaster recovery.
+
+This is [Supabase's fork](https://github.com/supabase/poolboy) of
+[devinus/poolboy](https://github.com/devinus/poolboy). It includes the
+following changes on top of upstream v1.5.2:
+
+### Idle overflow workers
+
+Overflow workers are no longer killed immediately when checked back in.
+Instead, they stay available for a configurable period (default: 5 minutes)
+before being dismissed. This reduces churn under bursty workloads. Set the
+`idle_timeout` pool option (in milliseconds) to control how long idle overflow
+workers are kept around.
+
+### Hot code reload compatibility
+
+Each pool now runs under a proper OTP supervision tree, making it compatible
+with hot code upgrades and standard OTP release tooling.
+
+### Breaking changes
+
+- `poolboy:start/1,2` has been removed. Use `poolboy:start_link/2`.
+- Pools now require a name.
+- Requires OTP 21+.
 
 ## Usage
 
@@ -157,6 +176,8 @@ code_change(_OldVsn, State, _Extra) ->
 - `max_overflow`: maximum number of workers created if pool is empty
 - `strategy`: `lifo` or `fifo`, determines whether checked in workers should be
   placed first or last in the line of available workers. So, `lifo` operates like a traditional stack; `fifo` like a queue. Default is `lifo`.
+- `idle_timeout`: time in milliseconds to keep idle overflow workers alive before
+  dismissing them. Default is `300000` (5 minutes).
 
 ## Authors
 
