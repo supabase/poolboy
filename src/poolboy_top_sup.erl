@@ -16,7 +16,10 @@ start_link(PoolArgs, WorkerArgs) ->
 init({PoolArgs, WorkerArgs}) ->
     Mod = proplists:get_value(worker_module, PoolArgs),
     Name = proplists:get_value(name, PoolArgs),
-    {ok, {{one_for_all, 0, 1}, [
+    {ok, {#{strategy => one_for_all,
+             intensity => 0,
+             period => 1,
+             auto_shutdown => any_significant}, [
                 #{id => poolboy_sup,
                   start => {poolboy_sup, start_link, [Mod, WorkerArgs]},
                   restart => permanent,
@@ -25,7 +28,8 @@ init({PoolArgs, WorkerArgs}) ->
                   modules => [poolboy_sup]},
                 #{id => poolboy,
                   start => {poolboy, start_link_worker, [Name, PoolArgs]},
-                  restart => permanent,
+                  restart => transient,
+                  significant => true,
                   shutdown => 5000,
                   type => worker,
                   modules => [poolboy]}

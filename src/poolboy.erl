@@ -34,7 +34,9 @@
     max_overflow = 10 :: non_neg_integer(),
     strategy = lifo :: lifo | fifo,
     idle_workers = #{} :: map(),
-    idle_timeout = timer:minutes(5) :: non_neg_integer()
+    idle_timeout = timer:minutes(5) :: non_neg_integer(),
+    inactivity_timeout = false :: false | pos_integer(),
+    inactivity_timer_ref = undefined :: undefined | reference()
 }).
 
 -spec checkout(Pool :: pool()) -> pid().
@@ -124,7 +126,8 @@ handle_continue(init, State) ->
     #state{size = Size} = State,
     Sup = find_worker_sup(),
     Workers = prepopulate(Size, Sup),
-    {noreply, State#state{supervisor = Sup, workers = Workers}}.
+    NewState = State#state{supervisor = Sup, workers = Workers},
+    {noreply, maybe_start_inactivity_timer(NewState)}.
 
 handle_cast({checkin, Pid}, State = #state{monitors = Monitors}) ->
     case ets:lookup(Monitors, Pid) of
@@ -178,11 +181,11 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
                 end,
             MRef = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            {reply, Pid, State#state{workers = Left, idle_workers = NewIdleWorkers, overflow = NewOverflow}};
+            {reply, Pid, cancel_inactivity_timer(State#state{workers = Left, idle_workers = NewIdleWorkers, overflow = NewOverflow})};
         {empty, _Left} when MaxOverflow > 0, Overflow + map_size(IdleWorkers) < MaxOverflow ->
             {Pid, MRef} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            {reply, Pid, State#state{overflow = Overflow + 1}};
+            {reply, Pid, cancel_inactivity_timer(State#state{overflow = Overflow + 1})};
         {empty, _Left} when Block =:= false ->
             {reply, full, State};
         {empty, _Left} ->
@@ -238,7 +241,7 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             true = erlang:demonitor(MRef),
             true = ets:delete(Monitors, Pid),
             NewState = handle_worker_exit(Pid, State),
-            {noreply, NewState};
+            {noreply, maybe_start_inactivity_timer(NewState)};
         [] ->
             WasIdle = maps:is_key(Pid, State#state.idle_workers),
             W = filter_worker_by_pid(Pid, State#state.workers),
@@ -246,7 +249,8 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             case WasIdle of
                 true ->
                     I = remove_from_idle(Pid, State#state.idle_workers),
-                    {noreply, State#state{workers = W, idle_workers = I}};
+                    NewState = State#state{workers = W, idle_workers = I},
+                    {noreply, maybe_start_inactivity_timer(NewState)};
                 false ->
                     {noreply, State#state{workers = queue:in(new_worker(Sup), W)}}
             end
@@ -258,6 +262,14 @@ handle_info({dismiss_idle, Pid}, #state{supervisor = Sup, idle_workers = IdleWor
     Workers = filter_worker_by_pid(Pid, State#state.workers),
     NewState = State#state{idle_workers = NewIdleWorkers, workers = Workers},
     {noreply, NewState};
+
+handle_info(inactivity_timeout_expired, #state{monitors = Monitors} = State) ->
+    case ets:info(Monitors, size) of
+        0 ->
+            {stop, {shutdown, inactivity_timeout}, State#state{inactivity_timer_ref = undefined}};
+        _ ->
+            {noreply, State#state{inactivity_timer_ref = undefined}}
+    end;
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -276,6 +288,10 @@ parse_opts([{max_overflow, MaxOverflow} | Rest], State) when is_integer(MaxOverf
     parse_opts(Rest, State#state{max_overflow = MaxOverflow});
 parse_opts([{idle_timeout, IdleTimeout} | Rest], State) when is_integer(IdleTimeout) ->
     parse_opts(Rest, State#state{idle_timeout = IdleTimeout});
+parse_opts([{inactivity_timeout, false} | Rest], State) ->
+    parse_opts(Rest, State#state{inactivity_timeout = false});
+parse_opts([{inactivity_timeout, Timeout} | Rest], State) when is_integer(Timeout), Timeout > 0 ->
+    parse_opts(Rest, State#state{inactivity_timeout = Timeout});
 parse_opts([{strategy, lifo} | Rest], State) ->
     parse_opts(Rest, State#state{strategy = lifo});
 parse_opts([{strategy, fifo} | Rest], State) ->
@@ -337,10 +353,12 @@ handle_checkin(Pid, State) ->
             Timer = erlang:send_after(State#state.idle_timeout, self(), {dismiss_idle, Pid}),
             NewIdleWorkers = maps:put(Pid, Timer, IdleWorkers),
             Workers = queue:in(Pid, State#state.workers),
-            State#state{workers = Workers, waiting = Empty, overflow = Overflow - 1, idle_workers = NewIdleWorkers};
+            NewState = State#state{workers = Workers, waiting = Empty, overflow = Overflow - 1, idle_workers = NewIdleWorkers},
+            maybe_start_inactivity_timer(NewState);
         {empty, Empty} ->
             Workers = queue:in(Pid, State#state.workers),
-            State#state{workers = Workers, waiting = Empty, overflow = 0}
+            NewState = State#state{workers = Workers, waiting = Empty, overflow = 0},
+            maybe_start_inactivity_timer(NewState)
     end.
 
 handle_worker_exit(Pid, State) ->
@@ -383,3 +401,22 @@ remove_from_idle(Pid, IdleWorkers) ->
             erlang:cancel_timer(Timer),
             NewIdleWorkers
     end.
+
+maybe_start_inactivity_timer(#state{inactivity_timeout = false} = State) ->
+    State;
+maybe_start_inactivity_timer(#state{inactivity_timer_ref = Ref} = State) when Ref =/= undefined ->
+    State;
+maybe_start_inactivity_timer(#state{inactivity_timeout = Timeout, monitors = Monitors} = State) ->
+    case ets:info(Monitors, size) of
+        0 ->
+            Ref = erlang:send_after(Timeout, self(), inactivity_timeout_expired),
+            State#state{inactivity_timer_ref = Ref};
+        _ ->
+            State
+    end.
+
+cancel_inactivity_timer(#state{inactivity_timer_ref = undefined} = State) ->
+    State;
+cancel_inactivity_timer(#state{inactivity_timer_ref = Ref} = State) ->
+    erlang:cancel_timer(Ref),
+    State#state{inactivity_timer_ref = undefined}.

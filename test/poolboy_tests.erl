@@ -94,7 +94,17 @@ pool_test_() ->
             {<<"Process links to worker then crashes">>,
                 {timeout, 10, fun process_links_to_worker_then_crashes/0}},
             {<<"Pool requires a name">>,
-                fun pool_missing_name/0}
+                fun pool_missing_name/0},
+            {<<"Pool shuts down after inactivity timeout">>,
+                {timeout, 10, fun inactivity_timeout_basic/0}},
+            {<<"Inactivity timer resets on checkout/checkin">>,
+                {timeout, 10, fun inactivity_timeout_reset_on_checkout/0}},
+            {<<"Pool stays alive while workers checked out">>,
+                {timeout, 10, fun inactivity_timeout_not_while_busy/0}},
+            {<<"Inactivity timeout disabled by default">>,
+                {timeout, 10, fun inactivity_timeout_disabled_by_default/0}},
+            {<<"Inactivity timeout works with overflow">>,
+                {timeout, 15, fun inactivity_timeout_with_overflow/0}}
         ]
     }.
 
@@ -795,6 +805,74 @@ process_links_to_worker_then_crashes() ->
     checkin_worker(Pid, B),
     ok = pool_call(Pid, stop).
 
+inactivity_timeout_basic() ->
+    {ok, Pid} = new_pool_with_inactivity_timeout(2, 0, 500),
+    PoolPid = whereis(Pid),
+    ?assert(is_pid(PoolPid)),
+    MRef = erlang:monitor(process, PoolPid),
+    receive
+        {'DOWN', MRef, process, PoolPid, _} -> ok
+    after 3000 ->
+        ?assert(false)
+    end,
+    ?assertEqual(undefined, whereis(Pid)).
+
+inactivity_timeout_reset_on_checkout() ->
+    {ok, Pid} = new_pool_with_inactivity_timeout(2, 0, 1000),
+    PoolPid = whereis(Pid),
+    %% Wait 700ms, then checkout to reset timer
+    timer:sleep(700),
+    ?assert(is_process_alive(PoolPid)),
+    Worker = poolboy:checkout(Pid),
+    poolboy:checkin(Pid, Worker),
+    %% Timer restarted on checkin; 700ms later it should still be alive
+    timer:sleep(700),
+    ?assert(is_process_alive(PoolPid)),
+    %% Now wait for the full timeout
+    MRef = erlang:monitor(process, PoolPid),
+    receive
+        {'DOWN', MRef, process, PoolPid, _} -> ok
+    after 3000 ->
+        ?assert(false)
+    end.
+
+inactivity_timeout_not_while_busy() ->
+    {ok, Pid} = new_pool_with_inactivity_timeout(2, 0, 500),
+    PoolPid = whereis(Pid),
+    Worker = poolboy:checkout(Pid),
+    %% Wait longer than the timeout
+    timer:sleep(1000),
+    ?assert(is_process_alive(PoolPid)),
+    %% Checkin, then pool should die after timeout
+    checkin_worker(Pid, Worker),
+    MRef = erlang:monitor(process, PoolPid),
+    receive
+        {'DOWN', MRef, process, PoolPid, _} -> ok
+    after 3000 ->
+        ?assert(false)
+    end.
+
+inactivity_timeout_disabled_by_default() ->
+    {ok, Pid} = new_pool(2, 0),
+    PoolPid = whereis(Pid),
+    timer:sleep(1000),
+    ?assert(is_process_alive(PoolPid)),
+    ok = pool_call(Pid, stop).
+
+inactivity_timeout_with_overflow() ->
+    {ok, Pid} = new_pool_with_inactivity_timeout(1, 2, 500),
+    PoolPid = whereis(Pid),
+    W1 = poolboy:checkout(Pid),
+    W2 = poolboy:checkout(Pid),
+    checkin_worker(Pid, W1),
+    checkin_worker(Pid, W2),
+    MRef = erlang:monitor(process, PoolPid),
+    receive
+        {'DOWN', MRef, process, PoolPid, _} -> ok
+    after 5000 ->
+        ?assert(false)
+    end.
+
 get_monitors(Pool) ->
     Pid = resolve_pid(Pool),
     %% Synchronise with the Pid to ensure it has handled all expected work.
@@ -834,6 +912,14 @@ new_pool_with_idle_timeout(Size, MaxOverflow, IdleTimeout) ->
                         {worker_module, poolboy_test_worker},
                         {size, Size}, {max_overflow, MaxOverflow},
                         {idle_timeout, IdleTimeout}], []),
+    unlink(SupPid),
+    {ok, poolboy_test}.
+
+new_pool_with_inactivity_timeout(Size, MaxOverflow, InactivityTimeout) ->
+    {ok, SupPid} = poolboy:start_link([{name, {local, poolboy_test}},
+                        {worker_module, poolboy_test_worker},
+                        {size, Size}, {max_overflow, MaxOverflow},
+                        {inactivity_timeout, InactivityTimeout}], []),
     unlink(SupPid),
     {ok, poolboy_test}.
 
