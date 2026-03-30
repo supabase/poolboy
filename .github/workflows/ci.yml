@@ -15,9 +15,9 @@ jobs:
         otp-version: ['25', '26', '27']
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
         with:
           otp-version: ${{ matrix.otp-version }}
           rebar3-version: '3.24'
@@ -28,14 +28,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
         with:
           otp-version: '27'
           rebar3-version: '3.24'
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: _build/default/rebar3_*_plt
           key: dialyzer-${{ hashFiles('rebar.lock') }}-otp27
