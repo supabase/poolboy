@@ -34,7 +34,8 @@
     max_overflow = 10 :: non_neg_integer(),
     strategy = lifo :: lifo | fifo,
     idle_workers = #{} :: map(),
-    idle_timeout = timer:minutes(5) :: non_neg_integer()
+    idle_timeout = timer:minutes(5) :: non_neg_integer(),
+    reclaim_strategy = checkin :: checkin | kill
 }).
 
 -spec checkout(Pool :: pool()) -> pid().
@@ -224,7 +225,7 @@ handle_info({'DOWN', MRef, _, _, _}, State) ->
     case ets:match(State#state.monitors, {'$1', '_', MRef}) of
         [[Pid]] ->
             true = ets:delete(State#state.monitors, Pid),
-            NewState = handle_checkin(Pid, State),
+            NewState = handle_owner_down(Pid, State),
             {noreply, NewState};
         [] ->
             Waiting = queue:filter(fun ({_, _, R}) -> R =/= MRef end, State#state.waiting),
@@ -280,6 +281,10 @@ parse_opts([{strategy, lifo} | Rest], State) ->
     parse_opts(Rest, State#state{strategy = lifo});
 parse_opts([{strategy, fifo} | Rest], State) ->
     parse_opts(Rest, State#state{strategy = fifo});
+parse_opts([{reclaim_strategy, checkin} | Rest], State) ->
+    parse_opts(Rest, State#state{reclaim_strategy = checkin});
+parse_opts([{reclaim_strategy, kill} | Rest], State) ->
+    parse_opts(Rest, State#state{reclaim_strategy = kill});
 parse_opts([_ | Rest], State) ->
     parse_opts(Rest, State);
 parse_opts([], State) ->
@@ -342,6 +347,12 @@ handle_checkin(Pid, State) ->
             Workers = queue:in(Pid, State#state.workers),
             State#state{workers = Workers, waiting = Empty, overflow = 0}
     end.
+
+handle_owner_down(Pid, #state{reclaim_strategy = checkin} = State) ->
+    handle_checkin(Pid, State);
+handle_owner_down(Pid, #state{reclaim_strategy = kill, supervisor = Sup} = State) ->
+    ok = dismiss_worker(Sup, Pid),
+    handle_worker_exit(Pid, State).
 
 handle_worker_exit(Pid, State) ->
     #state{supervisor = Sup,

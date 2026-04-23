@@ -47,6 +47,9 @@ pool_test_() ->
             {<<"Pool behaves on owner death">>,
                 fun owner_death/0
             },
+            {<<"Pool kills worker on owner death with kill reclaim strategy">>,
+                fun owner_death_kill_reclaim_strategy/0
+            },
             {<<"Worker checked-in after an exception in a transaction">>,
                 fun checkin_after_exception_in_transaction/0
             },
@@ -91,6 +94,8 @@ pool_test_() ->
                 fun idle_worker_pool_shutdown/0},
             {<<"Process dies holding overflow worker">>,
                 {timeout, 10, fun process_dies_holding_overflow_worker/0}},
+            {<<"Process dies holding overflow worker with kill reclaim strategy">>,
+                {timeout, 10, fun process_dies_holding_overflow_worker_kill_reclaim/0}},
             {<<"Process links to worker then crashes">>,
                 {timeout, 10, fun process_links_to_worker_then_crashes/0}},
             {<<"Pool requires a name">>,
@@ -402,6 +407,28 @@ owner_death() ->
         receive after 500 -> exit(normal) end
     end),
     timer:sleep(1000),
+    ?assertEqual(5, queue:len(pool_call(Pid, get_avail_workers))),
+    ?assertEqual(5, length(pool_call(Pid, get_all_workers))),
+    ?assertEqual(0, length(pool_call(Pid, get_all_monitors))),
+    ok = pool_call(Pid, stop).
+
+owner_death_kill_reclaim_strategy() ->
+    %% Check that a dead owner causes the pool to kill the worker and replace
+    %% it with a fresh one when reclaim_strategy is set to kill.
+    {ok, Pid} = new_pool_with_reclaim_strategy(5, 5, kill),
+    Worker = poolboy:checkout(Pid),
+    Self = self(),
+    spawn(fun() ->
+        W = poolboy:checkout(Pid),
+        Self ! {worker, W},
+        receive after 500 -> exit(normal) end
+    end),
+    OtherWorker = receive {worker, W} -> W end,
+    ok = poolboy:checkin(Pid, Worker),
+    timer:sleep(1000),
+    %% The worker should have been replaced, not reused
+    AvailWorkers = queue:to_list(pool_call(Pid, get_avail_workers)),
+    ?assertNot(lists:member(OtherWorker, AvailWorkers)),
     ?assertEqual(5, queue:len(pool_call(Pid, get_avail_workers))),
     ?assertEqual(5, length(pool_call(Pid, get_all_workers))),
     ?assertEqual(0, length(pool_call(Pid, get_all_monitors))),
@@ -752,6 +779,44 @@ process_dies_holding_overflow_worker() ->
     [checkin_worker(Pid, Worker) || Worker <- [A, B, C]],
     ok = pool_call(Pid, stop).
 
+process_dies_holding_overflow_worker_kill_reclaim() ->
+    %% With kill reclaim strategy, the overflow worker should be terminated
+    %% (not returned to the pool) when the holder dies, and the overflow
+    %% count should decrease.
+    {ok, Pid} = new_pool_with_idle_timeout_and_reclaim(2, 2, 5000, kill),
+    [A, B, C] = [poolboy:checkout(Pid) || _ <- lists:seq(1, 3)],
+    TestPid = self(),
+
+    Pid1 = spawn(fun() ->
+        Worker = poolboy:checkout(Pid),
+        TestPid ! {worker, Worker},
+        timer:sleep(1000),
+        exit(crash)
+    end),
+
+    OverflowWorker = receive {worker, W} -> W end,
+
+    MonRef = erlang:monitor(process, Pid1),
+    receive
+        {'DOWN', MonRef, process, Pid1, _} -> ok
+    end,
+
+    timer:sleep(1000),
+
+    %% Overflow worker should have been killed, not returned to pool
+    AvailWorkers = queue:to_list(pool_call(Pid, get_avail_workers)),
+    ?assertNot(lists:member(OverflowWorker, AvailWorkers)),
+    %% Should not appear as idle
+    IdleWorkers = pool_call(Pid, get_idle_workers),
+    ?assertNot(maps:is_key(OverflowWorker, IdleWorkers)),
+    %% Total workers should be base size (2) + 1 remaining overflow (C)
+    ?assertEqual(3, length(pool_call(Pid, get_all_workers))),
+    %% A, B, C are still checked out
+    ?assertEqual(3, length(pool_call(Pid, get_all_monitors))),
+
+    [checkin_worker(Pid, Worker) || Worker <- [A, B, C]],
+    ok = pool_call(Pid, stop).
+
 process_links_to_worker_then_crashes() ->
     {ok, Pid} = new_pool_with_idle_timeout(2, 2, 5000),
     [A, B] = [poolboy:checkout(Pid) || _ <- lists:seq(1, 2)],
@@ -826,6 +891,23 @@ new_pool(Size, MaxOverflow, Strategy) ->
                         {worker_module, poolboy_test_worker},
                         {size, Size}, {max_overflow, MaxOverflow},
                         {strategy, Strategy}], []),
+    unlink(SupPid),
+    {ok, poolboy_test}.
+
+new_pool_with_reclaim_strategy(Size, MaxOverflow, ReclaimStrategy) ->
+    {ok, SupPid} = poolboy:start_link([{name, {local, poolboy_test}},
+                        {worker_module, poolboy_test_worker},
+                        {size, Size}, {max_overflow, MaxOverflow},
+                        {reclaim_strategy, ReclaimStrategy}], []),
+    unlink(SupPid),
+    {ok, poolboy_test}.
+
+new_pool_with_idle_timeout_and_reclaim(Size, MaxOverflow, IdleTimeout, ReclaimStrategy) ->
+    {ok, SupPid} = poolboy:start_link([{name, {local, poolboy_test}},
+                        {worker_module, poolboy_test_worker},
+                        {size, Size}, {max_overflow, MaxOverflow},
+                        {idle_timeout, IdleTimeout},
+                        {reclaim_strategy, ReclaimStrategy}], []),
     unlink(SupPid),
     {ok, poolboy_test}.
 
