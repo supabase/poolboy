@@ -253,11 +253,15 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
     end;
 
 handle_info({dismiss_idle, Pid}, #state{supervisor = Sup, idle_workers = IdleWorkers} = State) ->
-    ok = dismiss_worker(Sup, Pid),
-    NewIdleWorkers = maps:remove(Pid, IdleWorkers),
-    Workers = filter_worker_by_pid(Pid, State#state.workers),
-    NewState = State#state{idle_workers = NewIdleWorkers, workers = Workers},
-    {noreply, NewState};
+    case maps:take(Pid, IdleWorkers) of
+        {_Timer, NewIdleWorkers} ->
+            ok = dismiss_worker(Sup, Pid),
+            Workers = filter_worker_by_pid(Pid, State#state.workers),
+            {noreply, State#state{idle_workers = NewIdleWorkers, workers = Workers}};
+        error ->
+            %% timer expired before the worker was checked out; stale message
+            {noreply, State}
+    end;
 
 handle_info(_Info, State) ->
     {noreply, State}.

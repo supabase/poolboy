@@ -83,6 +83,10 @@ pool_test_() ->
                 {timeout, 10, fun idle_worker_timer_cancellation/0}},
             {<<"Idle workers are removed on death">>,
                 {timeout, 10, fun idle_worker_dies_while_idle/0}},
+            {<<"Stale idle timer does not kill a checked-out worker">>,
+                {timeout, 10, fun idle_worker_stale_dismiss_timer/0}},
+            {<<"Stale idle timer, owner dies instead of checking in">>,
+                {timeout, 10, fun idle_worker_stale_dismiss_timer_owner_dies/0}},
             {<<"Multiple idle workers are managed correctly">>,
                 {timeout, 15, fun multiple_idle_workers/0}},
             {<<"Idle worker behavior with zero overflow">>,
@@ -828,6 +832,53 @@ new_pool(Size, MaxOverflow, Strategy) ->
                         {strategy, Strategy}], []),
     unlink(SupPid),
     {ok, poolboy_test}.
+
+idle_worker_stale_dismiss_timer() ->
+    {ok, Pid} = new_pool_with_idle_timeout(0, 1, 1000),
+    {W, Holder} = checkout_with_stale_dismiss_timer(Pid),
+    ?assert(is_process_alive(W)),
+    assert_idle_workers_exactly(Pid, []),
+    checkin_worker(Pid, W),
+    Holder ! release,
+    Avail = avail_workers_to_list(Pid),
+    ?assertEqual([W], Avail),
+    ?assert(lists:all(fun erlang:is_process_alive/1, Avail)),
+    Again = poolboy:checkout(Pid),
+    ?assert(is_process_alive(Again)),
+    checkin_worker(Pid, Again),
+    ok = poolboy:stop(Pid).
+
+idle_worker_stale_dismiss_timer_owner_dies() ->
+    {ok, Pid} = new_pool_with_idle_timeout(0, 1, 1000),
+    {W, Holder} = checkout_with_stale_dismiss_timer(Pid),
+    Holder ! release,
+    timer:sleep(500),
+    Avail = avail_workers_to_list(Pid),
+    ?assertEqual([W], Avail),
+    ?assert(lists:all(fun erlang:is_process_alive/1, Avail)),
+    Again = poolboy:checkout(Pid),
+    ?assert(is_process_alive(Again)),
+    checkin_worker(Pid, Again),
+    ok = poolboy:stop(Pid).
+
+checkout_with_stale_dismiss_timer(Pid) ->
+    W = poolboy:checkout(Pid),
+    checkin_worker(Pid, W),
+    assert_avail_workers_exactly(Pid, [W]),
+    assert_idle_workers_exactly(Pid, [W]),
+
+    ok = sys:suspend(Pid),
+    Self = self(),
+    Holder = spawn_link(fun() ->
+                            Self ! {checked_out, poolboy:checkout(Pid)},
+                            receive release -> ok end
+                        end),
+    timer:sleep(1000),
+    ok = sys:resume(Pid),
+    Got = receive {checked_out, P} -> P after 1000 -> error(no_checkout) end,
+    ?assertEqual(W, Got),
+    timer:sleep(100),
+    {W, Holder}.
 
 new_pool_with_idle_timeout(Size, MaxOverflow, IdleTimeout) ->
     {ok, SupPid} = poolboy:start_link([{name, {local, poolboy_test}},
