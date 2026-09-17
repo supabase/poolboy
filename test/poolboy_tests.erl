@@ -87,6 +87,8 @@ pool_test_() ->
                 {timeout, 10, fun idle_worker_stale_dismiss_timer/0}},
             {<<"Stale idle timer, owner dies instead of checking in">>,
                 {timeout, 10, fun idle_worker_stale_dismiss_timer_owner_dies/0}},
+            {<<"Idle worker dies after its dismiss timer fired">>,
+                {timeout, 10, fun idle_worker_dies_after_dismiss_timer_fires/0}},
             {<<"Multiple idle workers are managed correctly">>,
                 {timeout, 15, fun multiple_idle_workers/0}},
             {<<"Idle worker behavior with zero overflow">>,
@@ -859,6 +861,22 @@ idle_worker_stale_dismiss_timer_owner_dies() ->
     Again = poolboy:checkout(Pid),
     ?assert(is_process_alive(Again)),
     checkin_worker(Pid, Again),
+    ok = poolboy:stop(Pid).
+
+idle_worker_dies_after_dismiss_timer_fires() ->
+    {ok, Pid} = new_pool_with_idle_timeout(0, 1, 1000),
+    W = poolboy:checkout(Pid),
+    checkin_worker(Pid, W),
+    assert_avail_workers_exactly(Pid, [W]),
+    assert_idle_workers_exactly(Pid, [W]),
+    ok = sys:suspend(Pid),
+    timer:sleep(1100),
+    kill_worker(W),
+    ok = sys:resume(Pid),
+    assert_avail_workers_exactly(Pid, []),
+    assert_idle_workers_exactly(Pid, []),
+    assert_all_workers_exactly(Pid, []),
+    ?assertEqual({overflow, 0, 0, 0}, poolboy:status(Pid)),
     ok = poolboy:stop(Pid).
 
 checkout_with_stale_dismiss_timer(Pid) ->
