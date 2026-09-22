@@ -177,7 +177,9 @@ code_change(_OldVsn, State, _Extra) ->
 - `strategy`: `lifo` or `fifo`, determines whether checked in workers should be
   placed first or last in the line of available workers. So, `lifo` operates like a traditional stack; `fifo` like a queue. Default is `lifo`.
 - `idle_timeout`: time in milliseconds to keep idle overflow workers alive before
-  dismissing them. Default is `300000` (5 minutes).
+  dismissing them. Default is `300000` (5 minutes). Can be changed at runtime
+  with `poolboy:set_idle_timeout/2`, which also restarts the countdown for
+  workers that are already idle.
 
 ## Authors
 
