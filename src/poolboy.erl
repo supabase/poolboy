@@ -240,15 +240,18 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             NewState = handle_worker_exit(Pid, State),
             {noreply, NewState};
         [] ->
-            WasIdle = maps:is_key(Pid, State#state.idle_workers),
-            W = filter_worker_by_pid(Pid, State#state.workers),
-            % if it was idle, don't restart
-            case WasIdle of
-                true ->
-                    I = remove_from_idle(Pid, State#state.idle_workers),
-                    {noreply, State#state{workers = W, idle_workers = I}};
-                false ->
-                    {noreply, State#state{workers = queue:in(new_worker(Sup), W)}}
+            case remove_worker(Pid, State#state.workers) of
+                error ->
+                    %% already dismissed; the 'EXIT' was queued before the unlink
+                    {noreply, State};
+                {ok, W} ->
+                    case maps:is_key(Pid, State#state.idle_workers) of
+                        true ->
+                            I = remove_from_idle(Pid, State#state.idle_workers),
+                            {noreply, State#state{workers = W, idle_workers = I}};
+                        false ->
+                            {noreply, State#state{workers = queue:in(new_worker(Sup), W)}}
+                    end
             end
     end;
 
@@ -316,6 +319,15 @@ dismiss_worker(Sup, Pid) ->
 
 filter_worker_by_pid(Pid, Workers) ->
     queue:filter(fun (WPid) -> WPid =/= Pid end, Workers).
+
+remove_worker(Pid, Workers) ->
+    Remove = fun (WPid, {_, Acc}) when WPid =:= Pid -> {true, Acc};
+                 (WPid, {Found, Acc}) -> {Found, queue:in(WPid, Acc)}
+             end,
+    case queue:fold(Remove, {false, queue:new()}, Workers) of
+        {true, Left} -> {ok, Left};
+        {false, _} -> error
+    end.
 
 prepopulate(N, _Sup) when N < 1 ->
     queue:new();
