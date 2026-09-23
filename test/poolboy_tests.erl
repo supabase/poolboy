@@ -91,6 +91,12 @@ pool_test_() ->
                 {timeout, 10, fun idle_worker_dies_after_dismiss_timer_fires/0}},
             {<<"Multiple idle workers are managed correctly">>,
                 {timeout, 15, fun multiple_idle_workers/0}},
+            {<<"Idle timeout can be increased at runtime">>,
+                {timeout, 15, fun set_idle_timeout_increase/0}},
+            {<<"Idle timeout can be decreased at runtime">>,
+                {timeout, 15, fun set_idle_timeout_decrease/0}},
+            {<<"Idle timeout applies to workers checked in later">>,
+                {timeout, 15, fun set_idle_timeout_applies_to_new_idle_workers/0}},
             {<<"Idle worker behavior with zero overflow">>,
                 fun idle_worker_no_overflow/0},
             {<<"Idle worker behavior during pool shutdown">>,
@@ -664,6 +670,65 @@ multiple_idle_workers() ->
     assert_idle_workers_exactly(Pid, []),
 
     lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
+set_idle_timeout_increase() ->
+    {ok, Pid} = new_pool_with_idle_timeout(1, 2, 2000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 3)],
+    [A, B | Rest] = Workers,
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
+    assert_idle_workers_exactly(Pid, [A, B]),
+
+    ok = poolboy:set_idle_timeout(Pid, 6000),
+    timer:sleep(3000),
+
+    assert_avail_workers_exactly(Pid, [A, B]),
+    assert_all_workers_exactly(Pid, Workers),
+    assert_idle_workers_exactly(Pid, [A, B]),
+
+    timer:sleep(4000),
+
+    assert_avail_workers_exactly(Pid, []),
+    assert_all_workers_exactly(Pid, Rest),
+    assert_idle_workers_exactly(Pid, []),
+
+    lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
+set_idle_timeout_decrease() ->
+    {ok, Pid} = new_pool_with_idle_timeout(1, 2, 30000),
+    Workers = [poolboy:checkout(Pid) || _ <- lists:seq(1, 3)],
+    [A, B | Rest] = Workers,
+    checkin_worker(Pid, A),
+    checkin_worker(Pid, B),
+    assert_idle_workers_exactly(Pid, [A, B]),
+
+    ok = poolboy:set_idle_timeout(Pid, 1000),
+    timer:sleep(2000),
+
+    assert_avail_workers_exactly(Pid, []),
+    assert_all_workers_exactly(Pid, Rest),
+    assert_idle_workers_exactly(Pid, []),
+
+    lists:foreach(fun(W) -> checkin_worker(Pid, W) end, Rest),
+    ok = pool_call(Pid, stop).
+
+set_idle_timeout_applies_to_new_idle_workers() ->
+    {ok, Pid} = new_pool_with_idle_timeout(1, 1, 30000),
+    [A, B] = [poolboy:checkout(Pid) || _ <- lists:seq(1, 2)],
+
+    ok = poolboy:set_idle_timeout(Pid, 1500),
+    checkin_worker(Pid, B),
+    assert_idle_workers_exactly(Pid, [B]),
+
+    timer:sleep(2000),
+
+    assert_avail_workers_exactly(Pid, []),
+    assert_all_workers_exactly(Pid, [A]),
+    assert_idle_workers_exactly(Pid, []),
+
+    checkin_worker(Pid, A),
     ok = pool_call(Pid, stop).
 
 idle_worker_no_overflow() ->

@@ -5,7 +5,8 @@
 
 -export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
          transaction/3, child_spec/2, child_spec/3,
-         start_link/2, start_link_worker/2, stop/1, status/1]).
+         start_link/2, start_link_worker/2, stop/1, status/1,
+         set_idle_timeout/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          handle_continue/2, terminate/2, code_change/3]).
 -export_type([pool/0]).
@@ -113,6 +114,10 @@ stop(Pool) ->
 status(Pool) ->
     gen_server:call(Pool, status).
 
+-spec set_idle_timeout(Pool :: pool(), IdleTimeout :: non_neg_integer()) -> ok.
+set_idle_timeout(Pool, IdleTimeout) when is_integer(IdleTimeout), IdleTimeout >= 0 ->
+    gen_server:call(Pool, {set_idle_timeout, IdleTimeout}).
+
 init(PoolArgs) ->
     process_flag(trap_exit, true),
     Waiting = queue:new(),
@@ -204,6 +209,13 @@ handle_call(get_all_workers, _From, State) ->
     Sup = State#state.supervisor,
     WorkerList = supervisor:which_children(Sup),
     {reply, WorkerList, State};
+handle_call({set_idle_timeout, IdleTimeout}, _From, State)
+  when is_integer(IdleTimeout), IdleTimeout >= 0 ->
+    IdleWorkers = maps:map(fun (Pid, Timer) ->
+                               erlang:cancel_timer(Timer),
+                               erlang:send_after(IdleTimeout, self(), {dismiss_idle, Pid})
+                           end, State#state.idle_workers),
+    {reply, ok, State#state{idle_timeout = IdleTimeout, idle_workers = IdleWorkers}};
 handle_call(get_idle_workers, _From, State) ->
     Workers = State#state.idle_workers,
     {reply, Workers, State};
