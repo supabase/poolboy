@@ -24,7 +24,7 @@ with hot code upgrades and standard OTP release tooling.
 
 - `poolboy:start/1,2` has been removed. Use `poolboy:start_link/2`.
 - Pools now require a name.
-- Requires OTP 21+.
+- Requires OTP 27+.
 
 ## Usage
 

@@ -3,7 +3,7 @@
 -module(poolboy).
 -behaviour(gen_server).
 
--export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
+-export([checkout/1, checkout/2, checkout/3, checkout_async/1, checkin/2, transaction/2,
          transaction/3, child_spec/2, child_spec/3,
          start_link/2, start_link_worker/2, stop/1, status/1,
          set_idle_timeout/2]).
@@ -57,6 +57,14 @@ checkout(Pool, Block, Timeout) ->
             gen_server:cast(Pool, {cancel_waiting, CRef}),
             erlang:raise(Class, Reason, Stacktrace)
     end.
+
+%% Replies with {poolboy_checkout, CRef, Worker}, or
+%% {poolboy_checkout_down, CRef, process, Pool, Reason} if the pool dies.
+-spec checkout_async(Pool :: pid() | atom() | {atom(), node()}) -> reference().
+checkout_async(Pool) ->
+    CRef = erlang:monitor(process, Pool, [{tag, poolboy_checkout_down}]),
+    gen_server:cast(Pool, {checkout_async, CRef, self()}),
+    CRef.
 
 -spec checkin(Pool :: pool(), Worker :: pid()) -> ok.
 checkin(Pool, Worker) when is_pid(Worker) ->
@@ -160,41 +168,14 @@ handle_cast({cancel_waiting, CRef}, State) ->
             {noreply, State#state{waiting = Waiting}}
     end;
 
+handle_cast({checkout_async, CRef, FromPid}, State) ->
+    {noreply, checkout_worker(CRef, true, {FromPid, {async, CRef}}, State)};
+
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
-    #state{supervisor = Sup,
-           workers = Workers,
-           monitors = Monitors,
-           overflow = Overflow,
-           max_overflow = MaxOverflow,
-           idle_workers = IdleWorkers,
-           strategy = Strategy} = State,
-    case get_worker_with_strategy(Workers, Strategy) of
-        {{value, Pid},  Left} ->
-            {NewIdleWorkers, NewOverflow} =
-                case maps:get(Pid, IdleWorkers, undefined) of
-                    undefined ->
-                        {IdleWorkers, Overflow};
-                    Timer ->
-                        erlang:cancel_timer(Timer),
-                        {maps:remove(Pid, IdleWorkers), Overflow + 1}
-                end,
-            MRef = erlang:monitor(process, FromPid),
-            true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            {reply, Pid, State#state{workers = Left, idle_workers = NewIdleWorkers, overflow = NewOverflow}};
-        {empty, _Left} when MaxOverflow > 0, Overflow + map_size(IdleWorkers) < MaxOverflow ->
-            {Pid, MRef} = new_worker(Sup, FromPid),
-            true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            {reply, Pid, State#state{overflow = Overflow + 1}};
-        {empty, _Left} when Block =:= false ->
-            {reply, full, State};
-        {empty, _Left} ->
-            MRef = erlang:monitor(process, FromPid),
-            Waiting = queue:in({From, CRef, MRef}, State#state.waiting),
-            {noreply, State#state{waiting = Waiting}}
-    end;
+handle_call({checkout, CRef, Block}, From, State) ->
+    {noreply, checkout_worker(CRef, Block, From, State)};
 
 handle_call(status, _From, State) ->
     #state{workers = Workers,
@@ -304,6 +285,48 @@ parse_opts([_ | Rest], State) ->
 parse_opts([], State) ->
     State.
 
+checkout_worker(CRef, Block, {FromPid, _} = From, State) ->
+    #state{supervisor = Sup,
+           workers = Workers,
+           monitors = Monitors,
+           overflow = Overflow,
+           max_overflow = MaxOverflow,
+           idle_workers = IdleWorkers,
+           strategy = Strategy} = State,
+    case get_worker_with_strategy(Workers, Strategy) of
+        {{value, Pid},  Left} ->
+            {NewIdleWorkers, NewOverflow} =
+                case maps:get(Pid, IdleWorkers, undefined) of
+                    undefined ->
+                        {IdleWorkers, Overflow};
+                    Timer ->
+                        erlang:cancel_timer(Timer),
+                        {maps:remove(Pid, IdleWorkers), Overflow + 1}
+                end,
+            MRef = erlang:monitor(process, FromPid),
+            true = ets:insert(Monitors, {Pid, CRef, MRef}),
+            reply(From, Pid),
+            State#state{workers = Left, idle_workers = NewIdleWorkers, overflow = NewOverflow};
+        {empty, _Left} when MaxOverflow > 0, Overflow + map_size(IdleWorkers) < MaxOverflow ->
+            {Pid, MRef} = new_worker(Sup, FromPid),
+            true = ets:insert(Monitors, {Pid, CRef, MRef}),
+            reply(From, Pid),
+            State#state{overflow = Overflow + 1};
+        {empty, _Left} when Block =:= false ->
+            reply(From, full),
+            State;
+        {empty, _Left} ->
+            MRef = erlang:monitor(process, FromPid),
+            Waiting = queue:in({From, CRef, MRef}, State#state.waiting),
+            State#state{waiting = Waiting}
+    end.
+
+reply({FromPid, {async, CRef}}, Worker) ->
+    FromPid ! {poolboy_checkout, CRef, Worker},
+    ok;
+reply(From, Reply) ->
+    gen_server:reply(From, Reply).
+
 find_worker_sup() ->
     [Parent | _] = get('$ancestors'),
     Children = supervisor:which_children(Parent),
@@ -359,7 +382,7 @@ handle_checkin(Pid, State) ->
     case queue:out(Waiting) of
         {{value, {From, CRef, MRef}}, Left} ->
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            gen_server:reply(From, Pid),
+            reply(From, Pid),
             State#state{waiting = Left};
         {empty, Empty} when Overflow > 0 ->
             Timer = erlang:send_after(State#state.idle_timeout, self(), {dismiss_idle, Pid}),
@@ -381,7 +404,7 @@ handle_worker_exit(Pid, State) ->
         {{value, {From, CRef, MRef}}, LeftWaiting} ->
             NewWorker = new_worker(State#state.supervisor),
             true = ets:insert(Monitors, {NewWorker, CRef, MRef}),
-            gen_server:reply(From, NewWorker),
+            reply(From, NewWorker),
             State#state{waiting = LeftWaiting, idle_workers = NewIdleWorkers};
         {empty, Empty} when Overflow > 0 ->
             State#state{overflow = Overflow - 1, waiting = Empty, idle_workers = NewIdleWorkers};
