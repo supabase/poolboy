@@ -106,7 +106,17 @@ pool_test_() ->
             {<<"Process links to worker then crashes">>,
                 {timeout, 10, fun process_links_to_worker_then_crashes/0}},
             {<<"Pool requires a name">>,
-                fun pool_missing_name/0}
+                fun pool_missing_name/0},
+            {<<"Async checkout replies with an available worker">>,
+                fun checkout_async_available/0},
+            {<<"Async checkout waits for a checkin">>,
+                fun checkout_async_waits/0},
+            {<<"Async waiter dying while queued is dropped">>,
+                fun checkout_async_waiter_dies_queued/0},
+            {<<"Async waiter dying with an unread reply returns the worker">>,
+                fun checkout_async_waiter_dies_unread/0},
+            {<<"Async checkout is notified when the pool dies">>,
+                fun checkout_async_pool_dies/0}
         ]
     }.
 
@@ -865,6 +875,78 @@ process_links_to_worker_then_crashes() ->
     checkin_worker(Pid, A),
     checkin_worker(Pid, B),
     ok = pool_call(Pid, stop).
+
+checkout_async_available() ->
+    {ok, Pool} = new_pool(1, 0),
+    CRef = poolboy:checkout_async(Pool),
+    Worker = receive_async_checkout(CRef),
+    ?assert(is_pid(Worker)),
+    ?assertEqual({full, 0, 0, 1}, poolboy:status(Pool)),
+    checkin_worker(Pool, Worker),
+    ?assertEqual({ready, 1, 0, 0}, poolboy:status(Pool)),
+    ok = pool_call(Pool, stop).
+
+checkout_async_waits() ->
+    {ok, Pool} = new_pool(1, 0),
+    Worker = poolboy:checkout(Pool),
+    CRef = poolboy:checkout_async(Pool),
+    receive {poolboy_checkout, CRef, _} -> error(unexpected_checkout) after 100 -> ok end,
+    poolboy:checkin(Pool, Worker),
+    ?assertEqual(Worker, receive_async_checkout(CRef)),
+    ?assertEqual({full, 0, 0, 1}, poolboy:status(Pool)),
+    checkin_worker(Pool, Worker),
+    ok = pool_call(Pool, stop).
+
+checkout_async_waiter_dies_queued() ->
+    {ok, Pool} = new_pool(1, 0),
+    Worker = poolboy:checkout(Pool),
+    Waiter = spawn(fun() ->
+        poolboy:checkout_async(Pool),
+        receive stop -> ok end
+    end),
+    timer:sleep(100),
+    ?assertEqual(2, length(get_monitors(Pool))),
+    exit(Waiter, kill),
+    wait_for_exit(Waiter),
+    ?assertEqual(1, length(get_monitors(Pool))),
+    checkin_worker(Pool, Worker),
+    ?assertEqual({ready, 1, 0, 0}, poolboy:status(Pool)),
+    ok = pool_call(Pool, stop).
+
+checkout_async_waiter_dies_unread() ->
+    {ok, Pool} = new_pool(1, 0),
+    Worker = poolboy:checkout(Pool),
+    Waiter = spawn(fun() ->
+        poolboy:checkout_async(Pool),
+        receive stop -> ok end
+    end),
+    timer:sleep(100),
+    poolboy:checkin(Pool, Worker),
+    ?assertEqual({full, 0, 0, 1}, poolboy:status(Pool)),
+    exit(Waiter, kill),
+    wait_for_exit(Waiter),
+    ?assertEqual({ready, 1, 0, 0}, poolboy:status(Pool)),
+    ?assertEqual([], get_monitors(Pool)),
+    ok = pool_call(Pool, stop).
+
+checkout_async_pool_dies() ->
+    {ok, Pool} = new_pool(1, 0),
+    Worker = poolboy:checkout(Pool),
+    CRef = poolboy:checkout_async(Pool),
+    ok = poolboy:stop(Pool),
+    receive
+        {poolboy_checkout_down, CRef, process, _, _} -> ok
+    after 1000 ->
+        error(no_down)
+    end,
+    ?assertNot(is_process_alive(Worker)).
+
+receive_async_checkout(CRef) ->
+    receive
+        {poolboy_checkout, CRef, Worker} -> Worker
+    after 1000 ->
+        error(no_checkout)
+    end.
 
 get_monitors(Pool) ->
     Pid = resolve_pid(Pool),
