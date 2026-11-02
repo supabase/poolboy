@@ -37,6 +37,19 @@ ok
 ok
 ```
 
+The pool also frees a worker on its own when the process that checked it out
+dies. A `checkin/2` sent by another process can therefore arrive after the pool
+has already reclaimed the worker and handed it to someone else, and would free
+their checkout. To check a worker in from a process other than the owner, use
+the checkout's reference. It is ignored once that checkout has ended:
+
+```erl-sh
+1> {Worker, Ref} = poolboy:checkout_ref(PoolName).
+{<0.9001.0>,#Ref<0.1.2.3>}
+2> poolboy:checkin_ref(PoolName, Worker, Ref).
+ok
+```
+
 ## Example
 
 This is an example application showcasing database connection pools using

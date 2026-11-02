@@ -3,8 +3,9 @@
 -module(poolboy).
 -behaviour(gen_server).
 
--export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
-         transaction/3, child_spec/2, child_spec/3,
+-export([checkout/1, checkout/2, checkout/3, checkin/2,
+         checkout_ref/1, checkout_ref/2, checkout_ref/3, checkin_ref/3,
+         transaction/2, transaction/3, child_spec/2, child_spec/3,
          start_link/2, start_link_worker/2, stop/1, status/1,
          set_idle_timeout/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -38,6 +39,8 @@
     idle_timeout = timer:minutes(5) :: non_neg_integer()
 }).
 
+%% If the worker will be checked in by a process other than the caller, use
+%% checkout_ref and checkin_ref instead; see checkin/2.
 -spec checkout(Pool :: pool()) -> pid().
 checkout(Pool) ->
     checkout(Pool, true).
@@ -49,18 +52,51 @@ checkout(Pool, Block) ->
 -spec checkout(Pool :: pool(), Block :: boolean(), Timeout :: timeout())
     -> pid() | full.
 checkout(Pool, Block, Timeout) ->
+    case checkout_ref(Pool, Block, Timeout) of
+        {Pid, _CRef} -> Pid;
+        full -> full
+    end.
+
+%% As checkout/1,2,3, but also returns the reference identifying this
+%% checkout, for use with checkin_ref/3.
+-spec checkout_ref(Pool :: pool()) -> {pid(), reference()}.
+checkout_ref(Pool) ->
+    checkout_ref(Pool, true).
+
+-spec checkout_ref(Pool :: pool(), Block :: boolean())
+    -> {pid(), reference()} | full.
+checkout_ref(Pool, Block) ->
+    checkout_ref(Pool, Block, ?DEFAULT_TIMEOUT).
+
+-spec checkout_ref(Pool :: pool(), Block :: boolean(), Timeout :: timeout())
+    -> {pid(), reference()} | full.
+checkout_ref(Pool, Block, Timeout) ->
     CRef = make_ref(),
-    try
-        gen_server:call(Pool, {checkout, CRef, Block}, Timeout)
+    try gen_server:call(Pool, {checkout, CRef, Block}, Timeout) of
+        full -> full;
+        Pid -> {Pid, CRef}
     catch
         Class:Reason:Stacktrace ->
             gen_server:cast(Pool, {cancel_waiting, CRef}),
             erlang:raise(Class, Reason, Stacktrace)
     end.
 
+%% Only safe from the process that checked the worker out. From any other
+%% process it races the owner's death and can free someone else's checkout;
+%% use checkin_ref/3 instead.
 -spec checkin(Pool :: pool(), Worker :: pid()) -> ok.
 checkin(Pool, Worker) when is_pid(Worker) ->
     gen_server:cast(Pool, {checkin, Worker}).
+
+%% Checks Worker in only if it is still checked out under CRef, the reference
+%% returned by checkout_ref. Otherwise it is ignored, which makes it safe to
+%% call from a process other than the owner. checkin/2 is not: the pool also
+%% frees a worker when its owner dies, and may have handed it to someone else
+%% by the time a checkin from another process arrives, which would then free
+%% their checkout.
+-spec checkin_ref(Pool :: pool(), Worker :: pid(), CRef :: reference()) -> ok.
+checkin_ref(Pool, Worker, CRef) when is_pid(Worker), is_reference(CRef) ->
+    gen_server:cast(Pool, {checkin, Worker, CRef}).
 
 -spec transaction(Pool :: pool(), Fun :: fun((Worker :: pid()) -> any()))
     -> any().
@@ -131,16 +167,11 @@ handle_continue(init, State) ->
     Workers = prepopulate(Size, Sup),
     {noreply, State#state{supervisor = Sup, workers = Workers}}.
 
-handle_cast({checkin, Pid}, State = #state{monitors = Monitors}) ->
-    case ets:lookup(Monitors, Pid) of
-        [{Pid, _, MRef}] ->
-            true = erlang:demonitor(MRef),
-            true = ets:delete(Monitors, Pid),
-            NewState = handle_checkin(Pid, State),
-            {noreply, NewState};
-        [] ->
-            {noreply, State}
-    end;
+handle_cast({checkin, Pid}, State) ->
+    {noreply, checkin_worker(Pid, any, State)};
+
+handle_cast({checkin, Pid, CRef}, State) ->
+    {noreply, checkin_worker(Pid, CRef, State)};
 
 handle_cast({cancel_waiting, CRef}, State) ->
     case ets:match(State#state.monitors, {'$1', CRef, '$2'}) of
@@ -350,6 +381,17 @@ prepopulate(0, _Sup, Workers) ->
     Workers;
 prepopulate(N, Sup, Workers) ->
     prepopulate(N-1, Sup, queue:in(new_worker(Sup), Workers)).
+
+%% Frees Pid if it is checked out and, unless Ref is 'any', checked out under Ref.
+checkin_worker(Pid, Ref, State = #state{monitors = Monitors}) ->
+    case ets:lookup(Monitors, Pid) of
+        [{Pid, CRef, MRef}] when Ref =:= any; Ref =:= CRef ->
+            true = erlang:demonitor(MRef),
+            true = ets:delete(Monitors, Pid),
+            handle_checkin(Pid, State);
+        _ ->
+            State
+    end.
 
 handle_checkin(Pid, State) ->
     #state{waiting = Waiting,

@@ -85,6 +85,18 @@ pool_test_() ->
                 {timeout, 10, fun idle_worker_dies_while_idle/0}},
             {<<"Stale idle timer does not kill a checked-out worker">>,
                 {timeout, 10, fun idle_worker_stale_dismiss_timer/0}},
+            {<<"checkin_ref from another process frees the checkout's worker">>,
+                fun checkin_ref_frees_worker/0
+            },
+            {<<"checkin_ref is ignored once the owner died and the worker was handed out">>,
+                fun checkin_ref_ignored_after_reclaim/0
+            },
+            {<<"checkin_ref of an earlier checkout spares a later one of the same worker">>,
+                fun checkin_ref_ignored_for_earlier_checkout/0
+            },
+            {<<"checkin_ref frees a worker that reached its owner through the queue">>,
+                fun checkin_ref_frees_worker_of_waiter/0
+            },
             {<<"Stale idle timer, owner dies instead of checking in">>,
                 {timeout, 10, fun idle_worker_stale_dismiss_timer_owner_dies/0}},
             {<<"Idle worker dies after its dismiss timer fired">>,
@@ -999,3 +1011,67 @@ assert_idle_workers_exactly(Pool, ExpectedWorkers) ->
     ActualWorkers = idle_workers_pids(Pool),
     ?assertEqual(lists:sort(ExpectedWorkers), lists:sort(ActualWorkers)).
 
+
+checkin_ref_frees_worker() ->
+    {ok, Pid} = new_pool(1, 0),
+    {Worker, CRef} = poolboy:checkout_ref(Pid),
+    ?assertEqual(1, length(get_monitors(Pid))),
+    spawn(fun() -> poolboy:checkin_ref(Pid, Worker, CRef) end),
+    ?assertEqual(Worker, poolboy:checkout(Pid)),
+    %% The checkin demonitored the first owner; only our checkout remains.
+    ?assertEqual(1, length(get_monitors(Pid))),
+    ok = pool_call(Pid, stop).
+
+%% A late checkin_ref on a dead owner's behalf: the pool already gave the
+%% worker to someone else, who must keep it.
+checkin_ref_ignored_after_reclaim() ->
+    {ok, Pid} = new_pool(1, 0),
+    {Owner, {Worker, CRef}} = spawn_owner(Pid),
+    exit(Owner, kill),
+    %% Returns once the pool has seen the owner's DOWN.
+    ?assertEqual(Worker, poolboy:checkout(Pid)),
+    ok = poolboy:checkin_ref(Pid, Worker, CRef),
+    ?assertEqual(full, poolboy:checkout(Pid, false)),
+    ok = pool_call(Pid, stop).
+
+%% Same owner, same worker: only the checkout's reference tells the two apart.
+checkin_ref_ignored_for_earlier_checkout() ->
+    {ok, Pid} = new_pool(1, 0),
+    {Worker, Earlier} = poolboy:checkout_ref(Pid),
+    ok = poolboy:checkin_ref(Pid, Worker, Earlier),
+    {Worker, _Later} = poolboy:checkout_ref(Pid),
+    ok = poolboy:checkin_ref(Pid, Worker, Earlier),
+    ?assertEqual(full, poolboy:checkout(Pid, false)),
+    ok = pool_call(Pid, stop).
+
+checkin_ref_frees_worker_of_waiter() ->
+    {ok, Pid} = new_pool(1, 0),
+    Worker = poolboy:checkout(Pid),
+    Self = self(),
+    Waiter = spawn(fun() ->
+        Self ! {checked_out, poolboy:checkout_ref(Pid)},
+        receive stop -> ok end
+    end),
+    wait_until_calling(Waiter, 100),
+    ok = poolboy:checkin(Pid, Worker),
+    {Worker, CRef} = receive {checked_out, C} -> C after 1000 -> error(no_checkout) end,
+    ok = poolboy:checkin_ref(Pid, Worker, CRef),
+    ?assertEqual(Worker, poolboy:checkout(Pid, false)),
+    Waiter ! stop,
+    ok = pool_call(Pid, stop).
+
+spawn_owner(Pid) ->
+    Self = self(),
+    Owner = spawn(fun() ->
+        Self ! {checked_out, poolboy:checkout_ref(Pid)},
+        receive stop -> ok end
+    end),
+    receive {checked_out, Checkout} -> {Owner, Checkout} after 1000 -> error(no_checkout) end.
+
+wait_until_calling(_Pid, 0) ->
+    error(not_calling);
+wait_until_calling(Pid, Tries) ->
+    case erlang:process_info(Pid, current_function) of
+        {current_function, {gen, do_call, 4}} -> ok;
+        _ -> timer:sleep(10), wait_until_calling(Pid, Tries - 1)
+    end.
