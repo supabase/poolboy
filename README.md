@@ -20,6 +20,13 @@ workers are kept around.
 Each pool now runs under a proper OTP supervision tree, making it compatible
 with hot code upgrades and standard OTP release tooling.
 
+### Reference-based checkin
+
+`poolboy:checkout_ref/1,2,3` returns `{Worker, Ref}`, and
+`poolboy:checkin_ref/3` checks the worker in only if that checkout is still
+active. This makes it safe to check a worker in from a process other than the
+one that checked it out.
+
 ### Breaking changes
 
 - `poolboy:start/1,2` has been removed. Use `poolboy:start_link/2`.
